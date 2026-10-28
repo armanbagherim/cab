@@ -1,0 +1,94 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  firstName String
+  lastName  String
+  phone     String   @unique
+  role      String   @default("PASSENGER") // PASSENGER | DRIVER
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  sentTrips     Trip[]        @relation("PassengerTrips")
+  assignedTrips Trip[]        @relation("DriverTrips")
+  driverStatus  DriverStatus?
+  wallet        Wallet?
+}
+
+model DriverStatus {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isOnline    Boolean  @default(false)
+  isAccepting Boolean  @default(false)
+  isOnTrip    Boolean  @default(false)
+  latitude    Float?
+  longitude   Float?
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@index([isOnline, isAccepting, isOnTrip])
+}
+
+model Trip {
+  id             String    @id @default(uuid())
+  passengerId    String
+  passenger      User      @relation("PassengerTrips", fields: [passengerId], references: [id])
+  driverId       String?
+  driver         User?     @relation("DriverTrips", fields: [driverId], references: [id])
+  originLat      Float
+  originLng      Float
+  originAddress  String
+  destLat        Float
+  destLng        Float
+  destAddress    String
+  distanceKm     Float
+  durationMin    Int
+  estimatedPrice Float
+  status         String    @default("SEARCHING") // SEARCHING | OFFERED | ACCEPTED | DRIVER_ARRIVING | DRIVER_ARRIVED | IN_PROGRESS | COMPLETED | CANCELLED | NO_DRIVER_AVAILABLE
+  routeGeoJson   String? // Polyline or GeoJSON for route
+  createdAt      DateTime  @default(now())
+  acceptedAt     DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  cancelReason   String?
+  paymentMethod  String    @default("CASH") // CASH | WALLET
+  paymentStatus  String    @default("PENDING") // PENDING | PAID | REFUNDED
+  finalFare      Float?
+
+  @@index([passengerId])
+  @@index([driverId])
+  @@index([status])
+  @@index([status, driverId])
+}
+
+model Wallet {
+  id           String              @id @default(uuid())
+  userId       String              @unique
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance      Int                 @default(0) // toman — only mutated in atomic transactions
+  updatedAt    DateTime            @default(now()) @updatedAt
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id           String   @id @default(uuid())
+  walletId     String
+  wallet       Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  amount       Int // positive toman magnitude; `type` decides direction
+  type         String // CREDIT | DEBIT
+  source       String // SIGNUP_BONUS | RIDE_PAYMENT | REFUND | TOPUP
+  description  String   @default("")
+  tripId       String?
+  balanceAfter Int
+  createdAt    DateTime @default(now())
+
+  @@index([walletId, createdAt])
+}

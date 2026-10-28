@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Cab - سامانه حمل و نقل تهران",
+    "slug": "cab",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "cab",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cab.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم"
+      }
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم"
+        }
+      ],
+      "expo-secure-store",
+      "expo-font",
+      "expo-status-bar"
+    ]
+  }
+}

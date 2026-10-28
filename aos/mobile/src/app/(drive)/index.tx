@@ -1,0 +1,36 @@
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  ActivityIndicator,
+  StatusBar,
+  Vibration,
+  Platform,
+} from 'react-native';
+import { Stack, useRouter } from 'expo-router';
+import * as Location from 'expo-location';
+import { CabMap } from '../../components/CabMap';
+import { api } from '../../services/api';
+import { socket } from '../../services/socket';
+import { useAuth } from '../../context/AuthContext';
+import { COLORS } from '../../utils/theme';
+import type { TripOffer, Trip } from '../../types';
+
+const LOCATION_INTERVAL_MS = 3000;
+const OFFER_TIMEOUT_SEC = 15;
+
+export default function DriverScreen() {
+  const router = useRouter();
+  const { user, signOut } = useAuth();
+
+  const [isOnline, setIsOnline] = useState(false);
+  const [isAccepting, setIsAccepting] = useState(false);
+  const [isOnTrip, setIsOnTrip] = useState(false);
+  const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
+  const [offer setOffer] = useState<TripOffer | null>(null);
+  const [offerTimer setOfferTimer] = useState(OFFER_TIMOUT_SEC);
+  const [location setLocation] = useState<Location.LocationObjectCoords | null>(null);
+  const [loading setLoading] = useState(true);
