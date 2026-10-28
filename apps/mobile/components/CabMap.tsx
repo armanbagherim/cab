@@ -1,14 +1,15 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
-import NeshanMap, { NeshanMapRef, MapMarker, MapLine } from './map/NeshanMap';
+import NeshanMap, { NeshanMapRef, MapMarker, MapLine, MapCircle } from './map/NeshanMap';
 import { COLORS, FONTS, RADIUS } from '../utils/theme';
 
-export type { NeshanMapRef, MapMarker, MapLine };
+export type { NeshanMapRef, MapMarker, MapLine, MapCircle };
 
 interface CabMapProps {
   style?: any;
   markers?: MapMarker[];
   polyline?: MapLine | null;
+  circle?: MapCircle | null;
   onPress?: (lat: number, lng: number) => void;
   onMapMove?: () => void;
   onMapSettle?: (lat: number, lng: number) => void;
@@ -26,6 +27,7 @@ export function CabMap({
   style,
   markers,
   polyline,
+  circle,
   onPress,
   onMapMove,
   onMapSettle,
@@ -42,6 +44,7 @@ export function CabMap({
         ref={mapRef as any}
         markers={markers}
         polyline={polyline}
+        circle={circle}
         onPress={onPress}
         onMapMove={onMapMove}
         onMapSettle={onMapSettle}

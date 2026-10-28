@@ -45,6 +45,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Stable ref to logout so we can pass it to api without stale closures.
   const logoutRef = useRef<() => Promise<void>>(async () => {});
+  const loggingOutRef = useRef(false);
 
   useEffect(() => {
     if (bootedRef.current) return;
@@ -79,6 +80,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   const login = useCallback(async (newToken: string, newUser: User) => {
+    loggingOutRef.current = false;
     await storage.setItem('auth_token', newToken);
     await storage.setItem('auth_user', JSON.stringify(newUser));
     api.setToken(newToken);
@@ -92,20 +94,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await storage.removeItem('auth_token').catch(() => {});
-    await storage.removeItem('auth_user').catch(() => {});
+    if (loggingOutRef.current) return;
+    loggingOutRef.current = true;
     socketService.disconnect();
     api.setToken(null);
     setToken(null);
     setUser(null);
-    // Central redirect on EVERY sign-out path (button logout and the silent
-    // global-401 handler). Without this, a 401 while the user is on a group
-    // screen leaves them stranded with no way back to login.
+    try { router.dismissAll(); } catch {}
     router.replace('/');
+    // Persist cleanup after the UI has already left the protected route.
+    await storage.removeItem('auth_token').catch(() => {});
+    await storage.removeItem('auth_user').catch(() => {});
   }, []);
 
   // Keep ref in sync so api can call it without a stale closure.
   logoutRef.current = logout;
+  // Register before child screen effects run, so protected startup requests
+  // cannot escape without taking the app back to the public entry screen.
+  api.setUnauthorizedHandler(() => {
+    logoutRef.current().catch(() => {});
+  });
 
   // Register a global 401 handler: any API call that gets an Unauthorized
   // response automatically signs the user out and returns them to the root.

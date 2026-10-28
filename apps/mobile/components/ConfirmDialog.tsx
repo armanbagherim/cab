@@ -57,16 +57,15 @@ const s = StyleSheet.create({
   backdrop: {
     flex: 1,
     backgroundColor: 'rgba(10, 18, 15, 0.55)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: SPACING.xl,
+    justifyContent: 'flex-end',
   },
   card: {
     width: '100%',
-    maxWidth: 360,
     backgroundColor: COLORS.surface,
-    borderRadius: RADIUS.lg,
+    borderTopLeftRadius: RADIUS.xl,
+    borderTopRightRadius: RADIUS.xl,
     padding: SPACING.lg,
+    paddingBottom: SPACING.xxxl,
     ...SHADOW.lg,
   },
   title: {

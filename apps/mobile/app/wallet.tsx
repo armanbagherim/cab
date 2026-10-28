@@ -2,10 +2,9 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
-  View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Alert,
+  View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, TextInput, Modal,
 } from 'react-native';
 import { ArrowRightIcon, CashIcon } from '../components/Icons';
-import ConfirmDialog from '../components/ConfirmDialog';
 import { api } from '../services/api';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../utils/theme';
 
@@ -25,6 +24,8 @@ export default function WalletScreen() {
   const [error, setError] = useState('');
   const [topupOpen, setTopupOpen] = useState(false);
   const [topupMsg, setTopupMsg] = useState('');
+  const [topupAmount, setTopupAmount] = useState('200000');
+  const [topupLoading, setTopupLoading] = useState(false);
 
   const load = useCallback(async () => {
     setError('');
@@ -41,12 +42,24 @@ export default function WalletScreen() {
   useEffect(() => { load(); }, [load]);
 
   const tryTopup = useCallback(async () => {
+    const amount = Number(topupAmount.replace(/[^0-9]/g, ''));
+    if (!Number.isInteger(amount) || amount < 50_000) {
+      setTopupMsg('مبلغ افزایش موجودی نباید کمتر از ۵۰ هزار تومان باشد');
+      return;
+    }
+    setTopupLoading(true);
+    setTopupMsg('در حال انجام پرداخت آزمایشی...');
     try {
-      await api.topupWallet();
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await api.topupWallet(amount);
+      setTopupMsg('پرداخت موفق بود و موجودی کیف پول افزایش یافت');
+      await load();
     } catch (e: any) {
       setTopupMsg(e?.message || 'افزایش موجودی در دسترس نیست');
+    } finally {
+      setTopupLoading(false);
     }
-  }, []);
+  }, [load, topupAmount]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -110,14 +123,42 @@ export default function WalletScreen() {
         </>
       )}
 
-      <ConfirmDialog
-        visible={topupOpen}
-        title="افزایش موجودی"
-        description={topupMsg || 'درگاه پرداخت اینترنتی پیکربندی نشده است؛ افزایش موجودی آنلاین فعلاً در دسترس نیست.'}
-        confirmText={topupMsg ? 'متوجه شدم' : 'بررسی وضعیت'}
-        onCancel={() => { setTopupOpen(false); setTopupMsg(''); }}
-        onConfirm={() => { if (topupMsg) { setTopupOpen(false); setTopupMsg(''); } else tryTopup(); }}
-      />
+      <Modal visible={topupOpen} transparent animationType="fade" onRequestClose={() => setTopupOpen(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.topupModal}>
+            <Text style={styles.modalTitle}>افزایش موجودی</Text>
+            {topupMsg ? <Text style={styles.modalMessage}>{topupMsg}</Text> : null}
+            {!topupLoading && !topupMsg.includes('موفق') ? (
+              <>
+                <View style={styles.presets}>
+                  {[200_000, 500_000, 1_000_000].map((amount) => (
+                    <Pressable key={amount} style={styles.preset} onPress={() => setTopupAmount(String(amount))}>
+                      <Text style={styles.presetText}>{formatToman(amount)} تومان</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <TextInput
+                  value={topupAmount}
+                  onChangeText={setTopupAmount}
+                  keyboardType="number-pad"
+                  placeholder="مبلغ دلخواه"
+                  placeholderTextColor={COLORS.textTertiary}
+                  style={styles.amountInput}
+                  textAlign="right"
+                />
+              </>
+            ) : null}
+            {topupLoading ? <ActivityIndicator color={COLORS.brand} style={{ marginVertical: SPACING.lg }} /> : (
+              <View style={styles.modalActions}>
+                <Pressable style={styles.modalCancel} onPress={() => { setTopupOpen(false); setTopupMsg(''); }}>
+                  <Text style={styles.modalCancelText}>{topupMsg ? 'بستن' : 'انصراف'}</Text>
+                </Pressable>
+                {!topupMsg.includes('موفق') ? <Pressable style={styles.modalConfirm} onPress={tryTopup}><Text style={styles.modalConfirmText}>پرداخت آزمایشی</Text></Pressable> : null}
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -171,4 +212,17 @@ const styles = StyleSheet.create({
   txTitle: { fontFamily: FONTS.medium, fontSize: 14, color: COLORS.text, textAlign: 'right' },
   txDate: { fontFamily: FONTS.regular, fontSize: 11, color: COLORS.textTertiary, marginTop: 3, textAlign: 'right' },
   txAmount: { fontFamily: FONTS.bold, fontSize: 14 },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.42)', justifyContent: 'center', padding: SPACING.xl },
+  topupModal: { backgroundColor: COLORS.surface, borderRadius: RADIUS.xl, padding: SPACING.xl },
+  modalTitle: { fontFamily: FONTS.bold, fontSize: 18, color: COLORS.text, textAlign: 'right' },
+  modalMessage: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary, textAlign: 'right', marginTop: SPACING.md },
+  presets: { gap: SPACING.sm, marginTop: SPACING.lg },
+  preset: { backgroundColor: COLORS.brandSoft, borderRadius: RADIUS.md, padding: SPACING.md },
+  presetText: { fontFamily: FONTS.medium, fontSize: 13, color: COLORS.text, textAlign: 'right' },
+  amountInput: { marginTop: SPACING.md, backgroundColor: COLORS.bg, borderRadius: RADIUS.md, padding: SPACING.md, fontFamily: FONTS.medium, color: COLORS.text },
+  modalActions: { flexDirection: 'row-reverse', gap: SPACING.sm, marginTop: SPACING.lg },
+  modalCancel: { flex: 1, padding: SPACING.md, borderRadius: RADIUS.md, backgroundColor: COLORS.bg, alignItems: 'center' },
+  modalCancelText: { fontFamily: FONTS.medium, color: COLORS.textSecondary },
+  modalConfirm: { flex: 1, padding: SPACING.md, borderRadius: RADIUS.md, backgroundColor: COLORS.brand, alignItems: 'center' },
+  modalConfirmText: { fontFamily: FONTS.bold, color: '#fff' },
 });

@@ -43,24 +43,33 @@ export function initSocket(httpServer: HttpServer): Server {
     socket.on('driver:status', async (data: { isOnline?: boolean; isAccepting?: boolean }) => {
       if (user.role !== 'DRIVER') return;
       try {
-        await prisma.driverStatus.update({
+        const status = await prisma.driverStatus.update({
           where: { userId: user.userId },
           data: { ...data, updatedAt: new Date() },
         });
-        socket.broadcast.emit('driver:status_changed', { userId: user.userId, ...data });
+        console.log('[WS][DRIVER_STATUS]', { userId: user.userId, ...data, isOnline: status.isOnline, isAccepting: status.isAccepting });
+        io.emit('drivers:status', {
+          id: user.userId, isOnline: status.isOnline, isAccepting: status.isAccepting,
+          latitude: status.latitude, longitude: status.longitude,
+        });
       } catch (err) {
         console.error('[WS] Status update error:', err);
       }
     });
 
     // Driver location update (every 2-3 seconds)
-    socket.on('driver:location', async (data: { latitude: number; longitude: number }) => {
+    socket.on('driver:location', async (data: { latitude: number; longitude: number; heading?: number }) => {
       if (user.role !== 'DRIVER') return;
 
       try {
-        await prisma.driverStatus.update({
+        const status = await prisma.driverStatus.update({
           where: { userId: user.userId },
-          data: { latitude: data.latitude, longitude: data.longitude, updatedAt: new Date() },
+          data: { latitude: data.latitude, longitude: data.longitude, heading: data.heading, updatedAt: new Date() },
+        });
+        console.log('[WS][DRIVER_LOCATION]', { userId: user.userId, latitude: data.latitude, longitude: data.longitude, heading: data.heading, isOnline: status.isOnline, isAccepting: status.isAccepting });
+        io.emit('drivers:location', {
+          id: user.userId, latitude: data.latitude, longitude: data.longitude,
+          heading: data.heading, isOnline: status.isOnline, isAccepting: status.isAccepting,
         });
 
         // Send location to passenger of active trip
@@ -97,7 +106,8 @@ export function initSocket(httpServer: HttpServer): Server {
         }
       }
 
-      handleDriverResponse(data.tripId, user.userId, data.accepted);
+       console.log('[WS][TRIP_RESPONSE]', { driverId: user.userId, tripId: data.tripId, accepted: data.accepted });
+       handleDriverResponse(data.tripId, user.userId, data.accepted);
 
       if (!data.accepted) {
         io.to(`driver:${user.userId}`).emit('trip:offer_expired', { tripId: data.tripId });

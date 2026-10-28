@@ -20,7 +20,6 @@ class SocketService {
       if (this.socket.connected) return;
       this.socket.auth = { token };
       this.socket.connect();
-      this.attachAll();
       return;
     }
 
@@ -65,11 +64,9 @@ class SocketService {
    * rooms and reconcile their state with the authoritative API.
    */
   onConnect(handler: () => void): () => void {
-    this.socket?.on('connect', handler);
     this.connectHandlers.add(handler);
     return () => {
       this.connectHandlers.delete(handler);
-      this.socket?.off('connect', handler);
     };
   }
 

@@ -214,6 +214,7 @@ const styles = StyleSheet.create({
   primaryBtn: {
     marginTop: SPACING.lg, backgroundColor: COLORS.brand,
     borderRadius: RADIUS.lg, paddingVertical: 16, alignItems: 'center', justifyContent: 'center',
+    ...SHADOW.md,
   },
   primaryBtnDisabled: { opacity: 0.5 },
   primaryBtnText: { fontFamily: FONTS.bold, fontSize: 16, color: '#fff' },

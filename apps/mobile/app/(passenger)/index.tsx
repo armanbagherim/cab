@@ -9,9 +9,10 @@ import * as Location from 'expo-location';
 import { CabMap, NeshanMapRef } from '../../components/CabMap';
 import { LocateIcon, LocateOffIcon, SearchIcon, LogoutIcon, CloseIcon, ClockIcon, RoadIcon, HistoryIcon, PersonIcon } from '../../components/Icons';
 import { api } from '../../services/api';
+import { socketService } from '../../services/socket';
 import { useAuth } from '../../context/AuthContext';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
-import { decodePolyline, thinPolyline, coordKey, makeArc } from '../../utils/geo';
+import { decodePolyline, coordKey } from '../../utils/geo';
 
 type Point = { lat: number; lng: number; addr: string };
 type Stage = 'origin' | 'dest' | 'result';
@@ -36,7 +37,7 @@ let estimateCache: Record<string, CachedEstimate> = {};
 export default function PassengerHomeScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { logout } = useAuth();
+  const { logout, token } = useAuth();
   const mapRef = useRef<NeshanMapRef>(null);
 
   // ---- Selection state -------------------------------------------------------
@@ -61,11 +62,13 @@ export default function PassengerHomeScreen() {
   const searchSeq = useRef(0); // stale-response guard for the search API
 
   // ---- Fare / submission -----------------------------------------------------
-  const [estimate, setEstimate] = useState<{ distanceKm: number; durationMin: number; estimatedPrice: number } | null>(null);
+  const [estimate, setEstimate] = useState<CachedEstimate | null>(null);
   const [estimateError, setEstimateError] = useState<string | null>(null);
   const [estimating, setEstimating] = useState(false);
   const [creatingTrip, setCreatingTrip] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'WALLET'>('CASH');
+  const [walletBalance, setWalletBalance] = useState<number | null>(null);
+  const [nearbyDrivers, setNearbyDrivers] = useState<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number }>>([]);
   const [tripError, setTripError] = useState<string | null>(null);
   const panelH = useRef(0);
 
@@ -153,6 +156,50 @@ export default function PassengerHomeScreen() {
       return () => { stale = true; };
     }, [router])
   );
+
+  useFocusEffect(useCallback(() => {
+    api.getWallet().then((wallet) => setWalletBalance(wallet?.balance ?? 0)).catch(() => {});
+  }, []));
+
+  useFocusEffect(useCallback(() => {
+    let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const refresh = async () => {
+      if (!token) return;
+      const last = await Location.getLastKnownPositionAsync().catch(() => null);
+      const lat = last?.coords.latitude ?? centerRef.current.lat;
+      const lng = last?.coords.longitude ?? centerRef.current.lng;
+      try {
+        const drivers = await api.getNearbyDrivers(lat, lng);
+        console.log('[Passenger][NEARBY_HTTP]', { lat, lng, count: drivers?.length || 0 });
+        if (active) setNearbyDrivers(drivers || []);
+      } catch (error: any) {
+        console.warn('[Passenger][NEARBY_RETRY]', error?.message || error);
+        if (active) retryTimer = setTimeout(refresh, 5000);
+      }
+    };
+    const unsubs = [
+      socketService.on('drivers:location', (driver: any) => {
+        console.log('[Passenger][NEARBY_SOCKET_LOCATION]', driver);
+        if (!driver?.id || !driver.isOnline || !driver.isAccepting) return;
+        setNearbyDrivers((prev) => {
+          const next = { id: driver.id, latitude: driver.latitude, longitude: driver.longitude, heading: driver.heading, isAccepting: true, distanceKm: 0 };
+          return prev.some((item) => item.id === next.id) ? prev.map((item) => item.id === next.id ? { ...item, ...next } : item) : [...prev, next];
+        });
+      }),
+      socketService.on('drivers:status', (driver: any) => {
+        console.log('[Passenger][NEARBY_SOCKET_STATUS]', driver);
+        if (!driver?.id) return;
+        setNearbyDrivers((prev) => driver.isOnline && driver.isAccepting
+          ? prev.map((item) => item.id === driver.id ? { ...item, isAccepting: !!driver.isAccepting } : item)
+          : prev.filter((item) => item.id !== driver.id));
+      }),
+      socketService.onConnect(refresh),
+    ];
+    refresh();
+    const timer = setInterval(refresh, 30_000);
+    return () => { active = false; clearInterval(timer); if (retryTimer) clearTimeout(retryTimer); unsubs.forEach((unsubscribe) => unsubscribe()); };
+  }, [token]));
 
   // ---- Search ----------------------------------------------------------------
   useEffect(() => {
@@ -248,7 +295,7 @@ export default function PassengerHomeScreen() {
     const key = `${coordKey(o.lat, o.lng)}|${coordKey(d.lat, d.lng)}`;
     const cached = estimateCache[key];
     if (cached) {
-      setEstimate({ distanceKm: cached.distanceKm, durationMin: cached.durationMin, estimatedPrice: cached.estimatedPrice });
+      setEstimate(cached);
       return;
     }
     setEstimating(true);
@@ -268,7 +315,7 @@ export default function PassengerHomeScreen() {
         route: r.route || null,
       };
       estimateCache[key] = stored;
-      setEstimate({ distanceKm: r.distanceKm, durationMin: r.durationMin, estimatedPrice: r.estimatedPrice });
+      setEstimate(stored);
       // Lookups resolved with the estimate are authoritative for these exact
       // coordinates — fill the itinerary rows without extra geocode calls.
       if (r.originAddress) geocodeCache[coordKey(o.lat, o.lng)] = r.originAddress;
@@ -287,26 +334,16 @@ export default function PassengerHomeScreen() {
   const routeLine = useMemo(() => {
     if (!(stage === 'result' && origin && dest)) return null;
     const key = `${coordKey(origin.lat, origin.lng)}|${coordKey(dest.lat, dest.lng)}`;
-    const enc = estimateCache[key]?.route;
+    const enc = estimate?.route || estimateCache[key]?.route;
     if (enc) {
       // Real road geometry from the routing API is authoritative.
-      const decoded = thinPolyline(decodePolyline(enc));
+      const decoded = decodePolyline(enc);
       if (decoded.length > 1) {
         return { coordinates: decoded, color: COLORS.pinOrigin, to: COLORS.pinDest, width: 5 };
       }
     }
-    // No road geometry available: a restrained decorative arc keeps the
-    // preview readable and is never presented as a navigable route.
-    return {
-      coordinates: makeArc(
-        { latitude: origin.lat, longitude: origin.lng },
-        { latitude: dest.lat, longitude: dest.lng }
-      ),
-      color: COLORS.pinOrigin,
-      to: COLORS.pinDest,
-      width: 5,
-    };
-  }, [stage, origin?.lat, origin?.lng, dest?.lat, dest?.lng]);
+    return null;
+  }, [stage, origin?.lat, origin?.lng, dest?.lat, dest?.lng, estimate?.route]);
 
   useEffect(() => {
     if (stage === 'result' && origin && dest) {
@@ -316,11 +353,18 @@ export default function PassengerHomeScreen() {
           { latitude: origin.lat, longitude: origin.lng },
           { latitude: dest.lat, longitude: dest.lng },
         ],
-        100
+        260
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage]);
+
+  useEffect(() => {
+    const coordinates = routeLine?.coordinates;
+    if (stage === 'result' && coordinates && coordinates.length > 1) {
+      mapRef.current?.fitToCoordinates(coordinates, 260);
+    }
+  }, [stage, routeLine]);
 
   const retryEstimate = useCallback(() => {
     if (origin && dest) fetchEstimate(origin, dest);
@@ -329,6 +373,11 @@ export default function PassengerHomeScreen() {
   // ---- Submit -----------------------------------------------------------------
   const submitTrip = useCallback(async () => {
     if (!origin || !dest || creatingTrip) return;
+    if (paymentMethod === 'WALLET' && estimate && (walletBalance ?? 0) < estimate.estimatedPrice) {
+      setTripError('موجودی کیف پول کافی نیست؛ ابتدا کیف پول را شارژ کنید.');
+      router.push('/wallet');
+      return;
+    }
     setCreatingTrip(true);
     setTripError(null);
     try {
@@ -339,7 +388,7 @@ export default function PassengerHomeScreen() {
     } finally {
       setCreatingTrip(false);
     }
-  }, [origin, dest, creatingTrip, router]);
+  }, [origin, dest, creatingTrip, estimate, paymentMethod, walletBalance, router]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -351,11 +400,18 @@ export default function PassengerHomeScreen() {
 
   // ---- Derived, remount-safe map data ------------------------------------------
   const markers = useMemo(() => {
-    const m: Array<{ id: string; latitude: number; longitude: number; color?: string; label?: string }> = [];
+    const m: Array<{ id: string; latitude: number; longitude: number; color?: string; label?: string; glyph?: 'dot' | 'car' }> = nearbyDrivers.map((driver) => ({
+      id: `driver-${driver.id}`,
+      latitude: driver.latitude,
+      longitude: driver.longitude,
+      heading: driver.heading,
+      color: '#2563EB',
+      glyph: 'car',
+    }));
     if (origin) m.push({ id: 'origin', latitude: origin.lat, longitude: origin.lng, color: COLORS.pinOrigin, label: 'مبدأ' });
     if (stage === 'result' && dest) m.push({ id: 'dest', latitude: dest.lat, longitude: dest.lng, color: COLORS.pinDest, label: 'مقصد' });
     return m;
-  }, [origin?.lat, origin?.lng, dest?.lat, dest?.lng, stage]);
+  }, [origin?.lat, origin?.lng, dest?.lat, dest?.lng, stage, nearbyDrivers]);
 
   const polyline = routeLine;
 
@@ -404,7 +460,7 @@ export default function PassengerHomeScreen() {
       )}
 
       {/* ---------------- Top bar: search pill + logout ---------------- */}
-      {!searchOpen ? (
+      {stage !== 'result' && (!searchOpen ? (
         <>
           <Pressable
             style={({ pressed }) => [s.searchPill, pressed && { opacity: 0.94 }, { top: insets.top + 10 }]}
@@ -492,17 +548,17 @@ export default function PassengerHomeScreen() {
             />
           )}
         </KeyboardAvoidingView>
-      )}
+      ))}
 
       {/* ---------------- Locate-me FAB ---------------- */}
-      <Pressable
+      {stage !== 'result' ? <Pressable
         accessibilityLabel="موقعیت فعلی من"
         disabled={locatePhase === 'acquiring'}
         onPress={runLocate}
         style={({ pressed }) => [s.locateFab, pressed && { opacity: 0.85 }, { bottom: insets.bottom + (panelH.current || 0) + 18 }]}
       >
         {acquiring ? <LocateOffIcon size={22} color={COLORS.textTertiary} /> : <LocateIcon size={22} color={COLORS.brand} />}
-      </Pressable>
+      </Pressable> : null}
 
       {/* ---------------- Bottom panel (Enterprise Clean Sheet) ---------------- */}
       <View
@@ -597,7 +653,7 @@ export default function PassengerHomeScreen() {
                   ]}
                 >
                   <Text style={[s.payText, paymentMethod === m && s.payTextActive]}>
-                    {m === 'CASH' ? 'پرداخت نقدی' : 'کیف پول (موجودی)'}
+                    {m === 'CASH' ? 'پرداخت نقدی' : `کیف پول (${formatToman(walletBalance ?? 0)} تومان)`}
                   </Text>
                 </Pressable>
               ))}
@@ -607,24 +663,34 @@ export default function PassengerHomeScreen() {
           </View>
         )}
 
-        <Pressable
-          style={({ pressed }) => [
-            s.mainBtn,
-            (mainDisabled || creatingTrip) && s.mainBtnDisabled,
-            pressed && !mainDisabled && { opacity: 0.92 },
-          ]}
-          onPress={mainHandler}
-          disabled={mainDisabled || creatingTrip}
-        >
-          {creatingTrip ? (
-            <View style={s.mainBtnBusy}>
-              <ActivityIndicator color="#fff" size="small" />
-              <Text style={s.mainBtnText}>در حال هماهنگی با سفیران...</Text>
-            </View>
-          ) : (
-            <Text style={s.mainBtnText}>{mainLabel}</Text>
-          )}
-        </Pressable>
+        <View style={stage === 'result' ? s.resultActions : undefined}>
+          <Pressable
+            style={({ pressed }) => [
+              s.mainBtn,
+              stage === 'result' && s.resultMainBtn,
+              (mainDisabled || creatingTrip) && s.mainBtnDisabled,
+              pressed && !mainDisabled && { opacity: 0.92 },
+            ]}
+            onPress={mainHandler}
+            disabled={mainDisabled || creatingTrip}
+          >
+            {creatingTrip ? (
+              <View style={s.mainBtnBusy}>
+                <ActivityIndicator color="#fff" size="small" />
+                <Text style={s.mainBtnText}>در حال هماهنگی با سفیران...</Text>
+              </View>
+            ) : (
+              <Text style={s.mainBtnText}>{mainLabel}</Text>
+            )}
+          </Pressable>
+          {stage === 'result' ? (
+            <Pressable style={({ pressed }) => [s.cancelPreviewBtn, pressed && { opacity: 0.8 }]} onPress={() => {
+              setStage('origin'); setOrigin(null); setDest(null); setEstimate(null); setTripError(null); setPaymentMethod('CASH');
+            }}>
+              <Text style={s.cancelPreviewText}>انصراف</Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
     </View>
   );
@@ -655,7 +721,7 @@ const s = StyleSheet.create({
     flexDirection: 'row-reverse', alignItems: 'center', gap: 10,
     backgroundColor: '#FFFFFF', borderRadius: RADIUS.full,
     paddingVertical: 13, paddingHorizontal: 16,
-    borderWidth: 1, borderColor: '#E2E8F0', zIndex: 50,
+     zIndex: 50,
     shadowColor: '#0F172A',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.08,
@@ -669,7 +735,6 @@ const s = StyleSheet.create({
   },
   headerBtn: {
     width: 44, height: 44, borderRadius: 22, backgroundColor: '#FFFFFF',
-    borderWidth: 1, borderColor: '#E2E8F0',
     justifyContent: 'center', alignItems: 'center',
     shadowColor: '#0F172A',
     shadowOffset: { width: 0, height: 4 },
@@ -682,22 +747,20 @@ const s = StyleSheet.create({
   searchRow: {
     flexDirection: 'row-reverse', alignItems: 'center',
     backgroundColor: COLORS.surface, borderRadius: RADIUS.lg,
-    borderWidth: 1, borderColor: COLORS.border,
-    paddingHorizontal: 10, paddingVertical: 6,
+     paddingHorizontal: 10, paddingVertical: 6,
     ...SHADOW.md,
   },
   searchClose: { width: 36, height: 36, justifyContent: 'center', alignItems: 'center' },
-  searchInput: { flex: 1, fontFamily: FONTS.regular, fontSize: 14, color: COLORS.text, paddingVertical: 8, textAlign: 'right' },
+  searchInput: { flex: 1, fontFamily: FONTS.regular, fontSize: 14, color: COLORS.text, paddingVertical: 8, textAlign: 'right', outlineStyle: 'none' as any },
   searchMeta: { alignItems: 'center', paddingTop: 4 },
   searchMetaCard: {
     width: '100%', backgroundColor: COLORS.surface, borderRadius: RADIUS.lg,
     paddingVertical: 12, paddingHorizontal: SPACING.lg, marginTop: 6,
-    borderWidth: 1, borderColor: COLORS.border,
   },
   searchMetaText: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary, textAlign: 'right' },
   resultList: {
     backgroundColor: COLORS.surface, borderRadius: RADIUS.lg,
-    marginTop: 6, borderWidth: 1, borderColor: COLORS.border, maxHeight: 260,
+     marginTop: 6, maxHeight: 260,
   },
   resultItem: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: 10,
@@ -712,7 +775,7 @@ const s = StyleSheet.create({
   locateFab: {
     position: 'absolute', right: SPACING.lg, zIndex: 50,
     width: 48, height: 48, borderRadius: 24,
-    backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#E2E8F0',
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center', alignItems: 'center',
     shadowColor: '#0F172A',
     shadowOffset: { width: 0, height: 4 },
@@ -808,7 +871,7 @@ const s = StyleSheet.create({
     flex: 1, borderWidth: 1.5, borderColor: '#E2E8F0', borderRadius: RADIUS.lg,
     paddingVertical: 12, alignItems: 'center', backgroundColor: '#FFFFFF',
   },
-  payBtnActive: { borderColor: COLORS.brand, backgroundColor: 'rgba(15, 169, 88, 0.06)' },
+   payBtnActive: { borderColor: COLORS.success, backgroundColor: 'rgba(22, 163, 74, 0.08)' },
   payText: { fontFamily: FONTS.semibold, fontSize: 13, color: COLORS.textSecondary },
   payTextActive: { color: COLORS.brand, fontFamily: FONTS.bold },
   tripError: {
@@ -828,4 +891,8 @@ const s = StyleSheet.create({
   mainBtnDisabled: { opacity: 0.5, shadowOpacity: 0 },
   mainBtnText: { fontFamily: FONTS.bold, fontSize: 16, color: '#FFFFFF', letterSpacing: -0.2 },
   mainBtnBusy: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
+  resultActions: { flexDirection: 'row-reverse', gap: SPACING.sm },
+  resultMainBtn: { flex: 1 },
+  cancelPreviewBtn: { width: 84, borderRadius: RADIUS.lg, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.bg, alignItems: 'center', justifyContent: 'center' },
+  cancelPreviewText: { fontFamily: FONTS.bold, fontSize: 14, color: COLORS.textSecondary },
 });

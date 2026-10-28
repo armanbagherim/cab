@@ -179,9 +179,7 @@ router.post('/', authMiddleware, requireRole('PASSENGER'), async (req: Request, 
     }
 
     // Find & offer to nearest driver (async)
-    findAndOfferDriver(trip.id).catch((err) => {
-      console.error('Driver search error:', err);
-    });
+    ensureDispatch(trip.id);
 
     res.json({ success: true, data: trip });
   } catch (err) {
@@ -193,6 +191,19 @@ router.post('/', authMiddleware, requireRole('PASSENGER'), async (req: Request, 
   }
 });
 
+const activeDispatches = new Set<string>();
+
+export function ensureDispatch(tripId: string): void {
+  if (activeDispatches.has(tripId)) {
+    console.log('[DISPATCH][ALREADY_RUNNING]', { tripId });
+    return;
+  }
+  activeDispatches.add(tripId);
+  findAndOfferDriver(tripId)
+    .catch((err) => console.error('[DISPATCH][ERROR]', { tripId, error: err?.message || err }))
+    .finally(() => activeDispatches.delete(tripId));
+}
+
 async function findAndOfferDriver(tripId: string): Promise<void> {
   // Bounded search window (~150 s): instead of failing fast when no driver is
   // currently in range, we keep the trip in SEARCHING and re-scan the pool
@@ -200,6 +211,7 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
   // Driver acceptance always takes precedence over any later offer.
   const deadline = Date.now() + config.driverSearch.searchWindowMs;
   const offerHistory = new Set<string>(); // drivers already offered this run
+  console.log('[DISPATCH][START]', { tripId, deadlineMs: config.driverSearch.searchWindowMs });
 
   while (Date.now() < deadline) {
     const trip = await prisma.trip.findUnique({ where: { id: tripId } });
@@ -245,11 +257,14 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
       }
     }
 
-    // Sort by distance to trip origin. Two-stage dispatch: nearby drivers
-    // (within maxRadiusKm) are offered first; if no one nearby is available,
-    // fall back to ALL free drivers regardless of distance — a trip should
-    // reach any available driver rather than expire silently.
-    const nearby = eligibleDrivers
+    // Progressive radius expansion keeps nearby offers first without letting a
+    // request disappear just because the first search radius is empty.
+    const radiusIndex = Math.min(
+      config.driverSearch.radiusStepsKm.length - 1,
+      Math.floor((Date.now() - (deadline - config.driverSearch.searchWindowMs)) / 30_000),
+    );
+    const searchRadiusKm = config.driverSearch.radiusStepsKm[radiusIndex];
+    const withDistance = eligibleDrivers
       .map((d) => ({
         ...d,
         distance: calculateDistance(
@@ -257,12 +272,22 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
           d.latitude!, d.longitude!
         ),
       }))
-      .sort((a, b) => a.distance - b.distance)
-      .filter((d) => d.distance <= config.driverSearch.maxRadiusKm);
+      .sort((a, b) => {
+        const aPreferred = a.selectedActive && a.selectedLat !== null && a.selectedLng !== null
+          && calculateDistance(trip.originLat, trip.originLng, a.selectedLat, a.selectedLng) <= a.selectedRadiusKm;
+        const bPreferred = b.selectedActive && b.selectedLat !== null && b.selectedLng !== null
+          && calculateDistance(trip.originLat, trip.originLng, b.selectedLat, b.selectedLng) <= b.selectedRadiusKm;
+        return Number(bPreferred) - Number(aPreferred) || a.distance - b.distance;
+      });
+    const preferred = withDistance.filter((d) => d.selectedActive && d.selectedLat !== null && d.selectedLng !== null
+      && calculateDistance(trip.originLat, trip.originLng, d.selectedLat, d.selectedLng) <= d.selectedRadiusKm);
+    const nearby = withDistance
+      .filter((d) => d.distance <= searchRadiusKm);
 
-    const candidates = nearby.length > 0
-      ? nearby
-      : eligibleDrivers
+    const candidates = preferred.length > 0
+      ? [...preferred, ...nearby.filter((driver) => !preferred.some((item) => item.userId === driver.userId))]
+      : radiusIndex === config.driverSearch.radiusStepsKm.length - 1
+        ? eligibleDrivers
           .map((d) => ({
             ...d,
             distance: calculateDistance(
@@ -270,7 +295,22 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
               d.latitude!, d.longitude!
             ),
           }))
-          .sort((a, b) => a.distance - b.distance);
+           .sort((a, b) => {
+             const aPreferred = a.selectedActive && a.selectedLat !== null && a.selectedLng !== null
+               && calculateDistance(trip.originLat, trip.originLng, a.selectedLat, a.selectedLng) <= a.selectedRadiusKm;
+             const bPreferred = b.selectedActive && b.selectedLat !== null && b.selectedLng !== null
+               && calculateDistance(trip.originLat, trip.originLng, b.selectedLat, b.selectedLng) <= b.selectedRadiusKm;
+             return Number(bPreferred) - Number(aPreferred) || a.distance - b.distance;
+           })
+         : [];
+
+    console.log('[DISPATCH][SCAN]', {
+      tripId, status: trip.status, radiusKm: searchRadiusKm, radiusIndex,
+      preferred: preferred.map((d) => ({ id: d.userId, distanceKm: d.distance, selectedLat: d.selectedLat, selectedLng: d.selectedLng, selectedRadiusKm: d.selectedRadiusKm })),
+      eligible: eligibleDrivers.map((d) => ({ id: d.userId, online: d.isOnline, accepting: d.isAccepting, onTrip: d.isOnTrip, lat: d.latitude, lng: d.longitude })),
+      candidates: candidates.map((d) => ({ id: d.userId, distanceKm: d.distance, selectedActive: d.selectedActive, selectedLat: d.selectedLat, selectedLng: d.selectedLng, selectedRadiusKm: d.selectedRadiusKm })),
+      offeredBefore: [...offerHistory],
+    });
 
     const pool = candidates
       .filter((d) => !offerHistory.has(d.userId));
@@ -281,6 +321,7 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
 
       offerHistory.add(driver.userId);
       trackOffer(driver.userId, tripId);
+      console.log('[DISPATCH][OFFER]', { tripId, driverId: driver.userId, distanceKm: driver.distance, selectedActive: driver.selectedActive, selectedLat: driver.selectedLat, selectedLng: driver.selectedLng, selectedRadiusKm: driver.selectedRadiusKm });
 
       // Mark as OFFERED
       await prisma.trip.update({
@@ -306,6 +347,7 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
       const accepted = await waitForDriverResponse(tripId, driver.userId, config.driverSearch.timeoutMs);
 
       if (accepted) {
+        console.log('[DISPATCH][ACCEPTED]', { tripId, driverId: driver.userId });
         // Double check trip is still eligible before assigning
         const liveTrip = await prisma.trip.findUnique({ where: { id: tripId } });
         if (!liveTrip || liveTrip.status !== 'OFFERED') return;
@@ -337,6 +379,7 @@ async function findAndOfferDriver(tripId: string): Promise<void> {
 
       // Driver declined or timed out, notify and try next
       untrackOffer(driver.userId, tripId);
+      console.log('[DISPATCH][NO_ACCEPT]', { tripId, driverId: driver.userId });
       io.to(`driver:${driver.userId}`).emit('trip:offer_expired', { tripId });
 
       // If the trip was cancelled while waiting, stop
@@ -690,9 +733,7 @@ router.put('/:id/retry-dispatch', authMiddleware, requireRole('PASSENGER'), asyn
     });
     io.to(`trip:${trip.id}`).emit('trip:status', { tripId: trip.id, status: 'SEARCHING' });
 
-    findAndOfferDriver(trip.id).catch((err) => {
-      console.error('Driver re-dispatch error:', err);
-    });
+    ensureDispatch(trip.id);
 
     res.json({ success: true, data: updated });
   } catch {

@@ -3,34 +3,34 @@ import { Platform } from 'react-native';
 /**
  * Design tokens — Cab / سفیر
  * Persian-first, light premium mobility palette.
- * Accent: brand green (#0FA958 family), disciplined single accent.
+ * Accent: near-black, disciplined single accent.
  */
 
 export const COLORS = {
-  brand: '#0FA958',
-  brandDark: '#0B8A47',
-  brandSoft: '#E9F8F0',
-  brandBorder: '#BBE8CF',
+  brand: '#0A0A0A',
+  brandDark: '#000000',
+  brandSoft: '#F1F1F2',
+  brandBorder: '#D1D5DB',
 
-  bg: '#F6F7F9',
+  bg: '#F7F7F8',
   surface: '#FFFFFF',
   scrim: 'rgba(10, 18, 28, 0.45)',
 
-  text: '#111C27',
-  textSecondary: '#5D6B7A',
-  textTertiary: '#98A3AE',
+  text: '#111111',
+  textSecondary: '#6B7280',
+  textTertiary: '#9CA3AF',
   textOnDark: '#FFFFFF',
 
-  border: '#E5E9EE',
-  borderStrong: '#D3DAE1',
-  divider: '#F0F2F5',
+  border: '#E5E7EB',
+  borderStrong: '#D1D5DB',
+  divider: '#F1F1F2',
 
-  success: '#0FA958',
+  success: '#16A34A',
   warning: '#E8A20C',
   error: '#E5484D',
   info: '#2E7CF6',
 
-  pinOrigin: '#0FA958',
+  pinOrigin: '#111111',
   pinDest: '#E5484D',
   pinDriver: '#2E7CF6',
 } as const;
@@ -81,4 +81,8 @@ export const SHADOW = {
 export function formatToman(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return '—';
   return value.toLocaleString('fa-IR');
+}
+
+export function toPersianDigits(value: string | number): string {
+  return String(value).replace(/\d/g, (digit) => '۰۱۲۳۴۵۶۷۸۹'[Number(digit)]);
 }

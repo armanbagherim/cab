@@ -6,15 +6,15 @@ export const config = {
     isDev: true,
   },
   pricing: {
-    baseFare: 15000, // تومان
-    perKmRate: 3000, // تومان per km
-    perMinRate: 500, // تومان per minute
+    baseFare: 25000, // تومان
+    perKmRate: 4500, // تومان per km
+    perMinRate: 700, // تومان per minute
   },
   driverSearch: {
     timeoutMs: 15000, // per-driver offer timeout
     searchWindowMs: 150000, // total bounded search window (~2.5 min)
     pollIntervalMs: 8000, // re-scan for newly-available drivers while waiting
-    maxRadiusKm: 5,
+    radiusStepsKm: [2, 5, 10, 20],
   },
   location: {
     tehranBounds: {

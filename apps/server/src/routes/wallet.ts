@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import prisma from '../utils/prisma';
 import { authMiddleware } from '../middleware/auth';
-import { config } from '../config';
 
 const router = Router();
 
@@ -38,15 +38,26 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
   });
 });
 
-// Online top-up requires a configured payment gateway (IPG) with
-// server-side verification. None is configured in this environment, so the
-// endpoint refuses honestly instead of creating money from a client request.
-router.post('/topup', authMiddleware, async (_req: Request, res: Response) => {
-  if (!config.payments.gatewayConfigured) {
-    res.status(501).json({ success: false, error: 'درگاه پرداخت اینترنتی پیکربندی نشده است؛ افزایش موجودی فعلاً در دسترس نیست' });
+router.post('/topup', authMiddleware, async (req: Request, res: Response) => {
+  const parsed = z.object({ amount: z.number().int().min(50_000).max(50_000_000) }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'مبلغ افزایش موجودی باید حداقل ۵۰ هزار تومان باشد' });
     return;
   }
-  res.status(501).json({ success: false, error: 'درگاه پرداخت در دسترس نیست' });
+  const result = await prisma.$transaction(async (tx) => {
+    const wallet = await tx.wallet.upsert({
+      where: { userId: req.user!.userId },
+      create: { userId: req.user!.userId, balance: 0 },
+      update: {},
+    });
+    const nextBalance = wallet.balance + parsed.data.amount;
+    await tx.wallet.update({ where: { id: wallet.id }, data: { balance: nextBalance } });
+    await tx.walletTransaction.create({
+      data: { walletId: wallet.id, amount: parsed.data.amount, type: 'CREDIT', source: 'TOPUP', description: 'پرداخت آزمایشی افزایش موجودی', balanceAfter: nextBalance },
+    });
+    return { balance: nextBalance };
+  });
+  res.json({ success: true, data: result });
 });
 
 export default router;

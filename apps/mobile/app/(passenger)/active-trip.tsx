@@ -12,7 +12,7 @@ import { CabMap, NeshanMapRef } from '../../components/CabMap';
 import { PersonIcon, PhoneIcon, ArrowRightIcon, AlertIcon } from '../../components/Icons';
 import ConfirmDialog from '../../components/ConfirmDialog';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
-import { decodePolyline, thinPolyline, makeArc } from '../../utils/geo';
+import { decodePolyline } from '../../utils/geo';
 import { Trip, TripStatus } from '../../types';
 
 /**
@@ -78,13 +78,11 @@ export default function ActiveTripScreen() {
   useEffect(() => {
     if (!trip || fitted.current === trip.id) return;
     fitted.current = trip.id;
-    mapRef.current?.fitToCoordinates(
-      [
-        { latitude: trip.originLat, longitude: trip.originLng },
-        { latitude: trip.destLat, longitude: trip.destLng },
-      ],
-      90
-    );
+    const route = trip.routeGeoJson ? decodePolyline(trip.routeGeoJson) : [];
+    mapRef.current?.fitToCoordinates(route.length > 1 ? route : [
+      { latitude: trip.originLat, longitude: trip.originLng },
+      { latitude: trip.destLat, longitude: trip.destLng },
+    ], 140);
   }, [trip?.id]);
 
   // Initial fetch: by explicit tripId, falling back to the active trip.
@@ -266,20 +264,12 @@ export default function ActiveTripScreen() {
   const polyline = useMemo(() => {
     if (!trip) return null;
     if (trip.routeGeoJson) {
-      const decoded = thinPolyline(decodePolyline(trip.routeGeoJson));
+      const decoded = decodePolyline(trip.routeGeoJson);
       if (decoded.length > 1) {
         return { coordinates: decoded, color: COLORS.pinOrigin, to: COLORS.pinDest, width: 5 };
       }
     }
-    return {
-      coordinates: makeArc(
-        { latitude: trip.originLat, longitude: trip.originLng },
-        { latitude: trip.destLat, longitude: trip.destLng }
-      ),
-      color: COLORS.pinOrigin,
-      to: COLORS.pinDest,
-      width: 5,
-    };
+    return null;
   }, [trip?.id, trip?.routeGeoJson, trip?.originLat, trip?.originLng, trip?.destLat, trip?.destLng]);
 
   if (loading) {

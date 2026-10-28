@@ -230,9 +230,10 @@ const styles = StyleSheet.create({
   },
 
   primaryBtn: {
-    marginTop: SPACING.xxl, backgroundColor: COLORS.brand,
+    marginTop: 'auto', marginBottom: SPACING.lg, backgroundColor: COLORS.brand,
     borderRadius: RADIUS.lg, paddingVertical: 16,
     alignItems: 'center', justifyContent: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.14, shadowRadius: 10, elevation: 4,
   },
   btnDisabled: { opacity: 0.5 },
   btnText: { fontFamily: FONTS.bold, fontSize: 16, color: '#fff' },

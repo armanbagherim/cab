@@ -6,6 +6,8 @@ export interface MapMarker {
   longitude: number;
   color?: string;
   label?: string;
+  glyph?: 'dot' | 'car';
+  heading?: number;
 }
 
 export interface MapLine {
@@ -17,12 +19,20 @@ export interface MapLine {
   to?: string;
 }
 
+export interface MapCircle {
+  latitude: number;
+  longitude: number;
+  radiusKm: number;
+  color?: string;
+}
+
 export interface NeshanMapProps {
   style?: any;
   /** Static initial camera — applied only once at map load, never reapplied afterwards. */
   initialRegion?: { latitude: number; longitude: number; zoom?: number };
   markers?: MapMarker[];
   polyline?: MapLine | null;
+  circle?: MapCircle | null;
   onCenterChange?: (lat: number, lng: number) => void;
   onPress?: (lat: number, lng: number) => void;
   onMapMove?: () => void;
@@ -61,11 +71,17 @@ export const TEHRAN_CENTER = { lat: 35.6892, lng: 51.389 };
  * The tip is the anchor (bottom center): the rotated pin's tip lands at
  * (17, 29) in the 34×34 container, matching iconAnchor [17, 29].
  */
-export function pinHtml(color: string, label?: string, glyph: 'dot' | 'flag' = 'dot'): string {
-  const isFlag = glyph === 'flag';
-  const icon = isFlag
-    ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 21V4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M5 4h12l-2 5 2 5H5" fill="#fff"/></svg>`
-    : `<div style="width:7px;height:7px;border-radius:50%;background:#fff;box-shadow:0 0 4px rgba(255,255,255,0.8)"></div>`;
+export function pinHtml(color: string, label?: string, glyph: 'dot' | 'car' = 'dot', heading = 0): string {
+  if (glyph === 'car') {
+    return `<div class="vehicle-marker" style="width:34px;height:34px;display:flex;align-items:center;justify-content:center;pointer-events:none">` +
+      `<div class="vehicle-rotor" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;transform:rotate(${heading}deg);transition:transform .35s ease;filter:drop-shadow(0 2px 4px rgba(15,23,42,.3))">` +
+      `<svg width="26" height="30" viewBox="0 0 26 30" fill="none" xmlns="http://www.w3.org/2000/svg">` +
+      `<path d="M7 5.5C7.5 3.5 9 2 11 2h4c2 0 3.5 1.5 4 3.5l2.3 8.2V25c0 1.1-.9 2-2 2h-1.5c-1.1 0-2-.9-2-2v-1H10.2v1c0 1.1-.9 2-2 2H6.7c-1.1 0-2-.9-2-2V13.7L7 5.5Z" fill="${color}" stroke="#fff" stroke-width="1.5"/>` +
+      `<path d="M8 7h10l1.4 5H6.6L8 7Z" fill="#fff" fill-opacity=".9"/>` +
+      `<path d="M7 17h.1M19 17h.1" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>` +
+      `</svg></div></div>`;
+  }
+  const icon = `<div style="width:7px;height:7px;border-radius:50%;background:#fff;box-shadow:0 0 4px rgba(255,255,255,0.8)"></div>`;
 
   const labelHtml = label
     ? `<div style="position:absolute;left:50%;bottom:48px;transform:translateX(-50%);white-space:nowrap;` +

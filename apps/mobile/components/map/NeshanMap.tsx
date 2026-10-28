@@ -10,7 +10,7 @@ import { View, StyleSheet } from 'react-native';
 import WebViewRaw from 'react-native-webview';
 import { COLORS as THEME_COLORS, SHADOW } from '../../utils/theme';
 import {
-  MapMarker, MapLine, NeshanMapProps, NeshanMapRef,
+  MapMarker, MapLine, MapCircle, NeshanMapProps, NeshanMapRef,
   tileUrlTemplate, MAP_ATTRIBUTION, TEHRAN_CENTER,
   pinHtml, gradientSegments, NeshanMapComponent,
 } from './types';
@@ -54,8 +54,9 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
   html, body { width: 100%; height: 100%; overflow: hidden; background: #E9ECEF; }
   #map { width: 100%; height: 100%; }
   .leaflet-control-attribution { font-size: 9px; font-family: sans-serif; }
+  .vehicle-marker-icon { transition: transform .45s linear !important; }
   .vk-pin { display: flex; align-items: center; justify-content: center;
-    width: 14px; height: 14px; background: #0FA958; border: 3px solid #fff;
+     width: 14px; height: 14px; background: #111111; border: 3px solid #fff;
     border-radius: 50%; box-shadow: 0 1px 5px rgba(0,0,0,.35); }
   .vk-label { font-family: Vazirmatn, sans-serif; font-size: 11px; color: #111C27;
     background: rgba(255,255,255,.92); padding: 2px 8px; border-radius: 6px;
@@ -102,13 +103,38 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
     var gradientSegments = ${gradientSegments.toString()};
 
     var lineLayers = [];
+    var selectedCircle = null;
 
+    function setCircle(circle) {
+      if (selectedCircle) { map.removeLayer(selectedCircle); selectedCircle = null; }
+      if (circle) selectedCircle = L.circle([circle.latitude, circle.longitude], {
+        radius: circle.radiusKm * 1000, color: circle.color || '#111111', weight: 2,
+        fillColor: circle.color || '#111111', fillOpacity: 0.10,
+      }).addTo(map);
+    }
+
+    var markerRefs = {};
     function setMarkers(list) {
-      pinLayer.clearLayers();
+      var incoming = {};
       (list || []).forEach(function (m) {
-        L.marker([m.latitude, m.longitude], {
-          icon: L.divIcon({ className: '', html: pinHtml(m.color || '#0FA958', m.label), iconSize: [40, 48], iconAnchor: [20, 44] })
-        }).addTo(pinLayer);
+        incoming[m.id] = true;
+        var marker = markerRefs[m.id];
+        if (!marker) {
+          var vehicle = m.glyph === 'car';
+          marker = L.marker([m.latitude, m.longitude], {
+            icon: L.divIcon({ className: vehicle ? 'vehicle-marker-icon' : '', html: pinHtml(m.color || '#111111', m.label, m.glyph, m.heading || 0), iconSize: vehicle ? [34, 34] : [40, 48], iconAnchor: vehicle ? [17, 17] : [20, 44] })
+          }).addTo(pinLayer);
+          markerRefs[m.id] = marker;
+        } else {
+          marker.setLatLng([m.latitude, m.longitude]);
+          if (m.glyph === 'car') {
+            var rotor = marker.getElement() && marker.getElement().querySelector('.vehicle-rotor');
+            if (rotor) rotor.style.transform = 'rotate(' + (m.heading || 0) + 'deg)';
+          }
+        }
+      });
+      Object.keys(markerRefs).forEach(function (id) {
+        if (!incoming[id]) { pinLayer.removeLayer(markerRefs[id]); delete markerRefs[id]; }
       });
     }
 
@@ -128,7 +154,7 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
       if (!line || !line.coordinates || line.coordinates.length < 2) return;
       var cs = line.coordinates.map(function (c) { return [c.latitude, c.longitude]; });
       var w = line.width || 4;
-      var base = line.color || '#0FA958';
+       var base = line.color || '#111111';
 
       // 1) soft outer halo   2) depth shadow underlay   3) crisp foreground
       addPoly(cs, { color: '#0B1512', weight: w + 8, opacity: 0.07, lineCap: 'round', lineJoin: 'round' });
@@ -167,6 +193,8 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
         setMarkers(d.markers);
       } else if (d.type === 'line') {
         setLine(d.line);
+      } else if (d.type === 'circle') {
+        setCircle(d.circle);
       } else if (d.type === 'fit') {
         var cs = (d.coords || []).map(function (c) { return [c.latitude, c.longitude]; });
         if (cs.length === 1) { map.flyTo(cs[0], map.getZoom()); }
@@ -189,7 +217,7 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
 `;
 
 const NeshanMapNativeInner = forwardRef<NeshanMapRef, NeshanMapProps>((props, ref) => {
-  const { initialRegion, markers, polyline, onCenterChange, onPress, onMapMove, onMapSettle, onReady } = props;
+  const { initialRegion, markers, polyline, circle, onCenterChange, onPress, onMapMove, onMapSettle, onReady } = props;
 
   const webRef = useRef<WebViewInstance>(null);
   const readyRef = useRef(false);
@@ -249,8 +277,9 @@ const NeshanMapNativeInner = forwardRef<NeshanMapRef, NeshanMapProps>((props, re
   }, []);
 
   // Sync markers/polyline through the channel (no re-mount, no reload).
-  const markerKey = markers ? markers.map((m) => `${m.id}:${m.latitude.toFixed(6)},${m.longitude.toFixed(6)},${m.color || ''}`).join('|') : '';
+  const markerKey = markers ? markers.map((m) => `${m.id}:${m.latitude.toFixed(6)},${m.longitude.toFixed(6)},${m.color || ''},${m.glyph || ''},${m.heading || 0}`).join('|') : '';
   const lineKey = polyline ? polyline.coordinates.map((c) => `${c.latitude.toFixed(6)},${c.longitude.toFixed(6)}`).join('|') + (polyline.color || '') : '';
+  const circleKey = circle ? `${circle.latitude},${circle.longitude},${circle.radiusKm},${circle.color || ''}` : '';
 
   useEffect(() => {
     // Always post the current list — an empty list clears the pin layer.
@@ -266,6 +295,11 @@ const NeshanMapNativeInner = forwardRef<NeshanMapRef, NeshanMapProps>((props, re
     post({ type: 'line', line: polyline || null });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lineKey, post]);
+
+  useEffect(() => {
+    post({ type: 'circle', circle: circle || null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [circleKey, post]);
 
   useImperativeHandle(
     ref,
@@ -329,7 +363,7 @@ const styles = StyleSheet.create({
   pinBody: {
     width: 30, height: 30, borderRadius: 15,
     borderBottomRightRadius: 2,
-    transform: [{ rotate: '-45deg' }],
+    transform: [{ rotate: '45deg' }],
     borderWidth: 2.5, borderColor: '#FFFFFF',
     alignItems: 'center', justifyContent: 'center',
     marginBottom: 16,
@@ -341,7 +375,7 @@ const styles = StyleSheet.create({
   },
   pinGlyph: {
     width: 10, height: 10, borderRadius: 5, backgroundColor: '#FFFFFF',
-    transform: [{ rotate: '45deg' }],
+    transform: [{ rotate: '-45deg' }],
   },
   pinHalo: {
     position: 'absolute', bottom: '50%', marginBottom: -3,
@@ -354,4 +388,4 @@ const styles = StyleSheet.create({
 });
 
 export default NeshanMapNativeInner as NeshanMapComponent;
-export type { MapMarker, MapLine, NeshanMapProps, NeshanMapRef };
+export type { MapMarker, MapLine, MapCircle, NeshanMapProps, NeshanMapRef };

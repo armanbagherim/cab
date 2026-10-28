@@ -23,12 +23,18 @@ import {
 // warnings and broken default icons on web.
 function ensureLeafletCss() {
   if (typeof document === 'undefined') return;
-  if (document.querySelector('link[data-leaflet-css]')) return;
-  const link = document.createElement('link');
-  link.rel = 'stylesheet';
-  link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-  link.setAttribute('data-leaflet-css', '');
-  document.head.appendChild(link);
+  if (!document.querySelector('link[data-leaflet-css]')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    link.setAttribute('data-leaflet-css', '');
+    document.head.appendChild(link);
+  }
+  if (document.querySelector('style[data-rahino-markers]')) return;
+  const style = document.createElement('style');
+  style.setAttribute('data-rahino-markers', '');
+  style.textContent = '.vehicle-marker-icon { transition: transform .45s linear !important; }';
+  document.head.appendChild(style);
 }
 
 /**
@@ -45,13 +51,15 @@ function ensureLeafletCss() {
  */
 
 const NeshanMapWeb = forwardRef<NeshanMapRef, NeshanMapProps>((props, ref) => {
-  const { initialRegion, markers, polyline, onCenterChange, onPress, onMapMove, onMapSettle, onReady } = props;
+  const { initialRegion, markers, polyline, circle, onCenterChange, onPress, onMapMove, onMapSettle, onReady } = props;
 
   const wrapRef = useRef<any>(null);
   ensureLeafletCss();
   const mapRef = useRef<L.Map | null>(null);
   const pinLayerRef = useRef<any>(null);
   const lineLayersRef = useRef<any[]>([]);
+  const markerRefs = useRef<Map<string, any>>(new Map());
+  const circleRef = useRef<any>(null);
   const readyRef = useRef(false);
   const centerRef = useRef({ lat: TEHRAN_CENTER.lat, lng: TEHRAN_CENTER.lng });
 
@@ -126,21 +134,31 @@ const NeshanMapWeb = forwardRef<NeshanMapRef, NeshanMapProps>((props, ref) => {
 
   // ---- Markers: diffed by a stable key so lists are only re-applied on change ----
   const markerKey = markers
-    ? markers.map((m) => `${m.id}:${m.latitude.toFixed(6)},${m.longitude.toFixed(6)},${m.color || ''}`).join('|')
+    ? markers.map((m) => `${m.id}:${m.latitude.toFixed(6)},${m.longitude.toFixed(6)},${m.color || ''},${m.glyph || ''},${m.heading || 0}`).join('|')
     : '';
   useEffect(() => {
     const pinLayer = pinLayerRef.current;
     if (!pinLayer) return;
-    pinLayer.clearLayers();
+    const markerMap = markerRefs.current;
+    const incoming = new Set<string>();
     (markers || []).forEach((m) => {
-      L.marker([m.latitude, m.longitude], {
-        icon: L.divIcon({
-          className: '',
-          html: pinHtml(m.color || COLORS.brand, m.label),
-          iconSize: [40, 48],
-          iconAnchor: [20, 44],
-        }),
-      }).addTo(pinLayer);
+      incoming.add(m.id);
+      const vehicle = m.glyph === 'car';
+      const marker = markerMap.get(m.id);
+      if (!marker) {
+        markerMap.set(m.id, L.marker([m.latitude, m.longitude], {
+          icon: L.divIcon({ className: vehicle ? 'vehicle-marker-icon' : '', html: pinHtml(m.color || COLORS.brand, m.label, m.glyph, m.heading || 0), iconSize: vehicle ? [34, 34] : [40, 48], iconAnchor: vehicle ? [17, 17] : [20, 44] }),
+        }).addTo(pinLayer));
+      } else {
+        marker.setLatLng([m.latitude, m.longitude]);
+        if (vehicle) {
+          const rotor = marker.getElement()?.querySelector('.vehicle-rotor') as HTMLElement | null;
+          if (rotor) rotor.style.transform = `rotate(${m.heading || 0}deg)`;
+        }
+      }
+    });
+    markerMap.forEach((marker: any, id: string) => {
+      if (!incoming.has(id)) { pinLayer.removeLayer(marker); markerMap.delete(id); }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markerKey]);
@@ -184,6 +202,19 @@ const NeshanMapWeb = forwardRef<NeshanMapRef, NeshanMapProps>((props, ref) => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lineKey]);
+
+  const circleKey = circle ? `${circle.latitude},${circle.longitude},${circle.radiusKm},${circle.color || ''}` : '';
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (circleRef.current) { map.removeLayer(circleRef.current); circleRef.current = null; }
+    if (circle) {
+      circleRef.current = L.circle([circle.latitude, circle.longitude], {
+        radius: circle.radiusKm * 1000, color: circle.color || '#111111', weight: 2,
+        fillColor: circle.color || '#111111', fillOpacity: 0.10,
+      }).addTo(map);
+    }
+  }, [circleKey]);
 
   useImperativeHandle(
     ref,

@@ -11,8 +11,8 @@ import { socketService } from '../../services/socket';
 import { useAuth } from '../../context/AuthContext';
 import { LogoutIcon, PersonIcon, PhoneIcon, CarIcon, CloseIcon, HistoryIcon } from '../../components/Icons';
 import ConfirmDialog from '../../components/ConfirmDialog';
-import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
-import { decodePolyline, thinPolyline, makeArc } from '../../utils/geo';
+import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman, toPersianDigits } from '../../utils/theme';
+import { decodePolyline } from '../../utils/geo';
 import { Trip, TripStatus } from '../../types';
 
 /** Driver action buttons follow the server's real transition map:
@@ -33,6 +33,13 @@ function driverActions(status: TripStatus | undefined) {
   }
 }
 
+function bearingBetween(from: { latitude: number; longitude: number }, to: { latitude: number; longitude: number }) {
+  const lat1 = from.latitude * Math.PI / 180;
+  const lat2 = to.latitude * Math.PI / 180;
+  const dLng = (to.longitude - from.longitude) * Math.PI / 180;
+  return (Math.atan2(Math.sin(dLng) * Math.cos(lat2), Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng)) * 180 / Math.PI + 360) % 360;
+}
+
 export default function DriverScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -50,10 +57,25 @@ export default function DriverScreen() {
   const [actionBusy, setActionBusy] = useState(false);
   const [dialog, setDialog] = useState<null | { title: string; message?: string; danger?: boolean; onConfirm?: () => void; confirmText?: string }>(null);
   const [navSheetVisible, setNavSheetVisible] = useState(false);
+  const [routePicking, setRoutePicking] = useState(false);
+  const [selectedRoute, setSelectedRoute] = useState<{ latitude: number; longitude: number; radiusKm: number; active: boolean } | null>(null);
 
   const coordsRef = useRef<{ latitude: number; longitude: number } | null>(null);
+  const lastCoordsRef = useRef<{ latitude: number; longitude: number } | null>(null);
+  const headingRef = useRef(0);
   const isOnlineRef = useRef(isOnline);
   useEffect(() => { isOnlineRef.current = isOnline; }, [isOnline]);
+
+  const sendDriverLocation = useCallback((latitude: number, longitude: number, nativeHeading?: number | null) => {
+    const next = { latitude, longitude };
+    const heading = typeof nativeHeading === 'number' && nativeHeading >= 0
+      ? nativeHeading
+      : lastCoordsRef.current ? bearingBetween(lastCoordsRef.current, next) : headingRef.current;
+    coordsRef.current = next;
+    lastCoordsRef.current = next;
+    headingRef.current = heading;
+    if (isOnlineRef.current) socketService.emit('driver:location', { ...next, heading });
+  }, []);
 
   const driverName = user ? `${user.firstName} ${user.lastName}`.trim() : 'سفیر';
 
@@ -71,10 +93,7 @@ export default function DriverScreen() {
             if (currentPos?.coords) {
               const lat = currentPos.coords.latitude;
               const lng = currentPos.coords.longitude;
-              coordsRef.current = { latitude: lat, longitude: lng };
-              if (isOnlineRef.current) {
-                socketService.emit('driver:location', { latitude: lat, longitude: lng });
-              }
+              sendDriverLocation(lat, lng, currentPos.coords.heading);
             }
           } catch {}
 
@@ -82,16 +101,30 @@ export default function DriverScreen() {
           watching = await Location.watchPositionAsync({ accuracy: 3, timeInterval: 4000, distanceInterval: 10 }, (loc) => {
             const lat = loc.coords.latitude;
             const lng = loc.coords.longitude;
-            coordsRef.current = { latitude: lat, longitude: lng };
-            if (isOnlineRef.current) {
-              socketService.emit('driver:location', { latitude: lat, longitude: lng });
-            }
+            sendDriverLocation(lat, lng, loc.coords.heading);
           });
         }
         const profile = await api.getProfile();
         if (cancelled) return;
         setIsOnline(!!profile?.driverStatus?.isOnline);
         setIsAccepting(!!profile?.driverStatus?.isAccepting);
+        isOnlineRef.current = !!profile?.driverStatus?.isOnline;
+        if (isOnlineRef.current && coordsRef.current) {
+          sendDriverLocation(coordsRef.current.latitude, coordsRef.current.longitude);
+        }
+        if (profile?.driverStatus?.selectedLat != null && profile?.driverStatus?.selectedLng != null) {
+          console.log('[Driver][SELECTED_ROUTE_PROFILE]', profile.driverStatus);
+          setSelectedRoute({
+            latitude: profile.driverStatus.selectedLat,
+            longitude: profile.driverStatus.selectedLng,
+            radiusKm: profile.driverStatus.selectedRadiusKm || 5,
+            active: !!profile.driverStatus.selectedActive,
+          });
+        }
+        // Also hit the driver status endpoint on login so the server wakes
+        // pending searches even when the trip was created before this socket connected.
+        const persistedStatus = await api.getDriverStatus();
+        console.log('[Driver][STATUS_ON_LOGIN]', persistedStatus);
 
         const active = await api.getDriverActiveTrip();
         if (cancelled) return;
@@ -112,6 +145,7 @@ export default function DriverScreen() {
       // with its own independent 15 s expiry — one expiring (or being
       // accepted) never erases the others.
       socketService.on('trip:offer', (data: any) => {
+        console.log('[Driver][TRIP_OFFER]', data);
         if (!data?.tripId) return;
         setOffers((prev) => {
           if (prev.some((o) => o.tripId === data.tripId)) return prev;
@@ -121,9 +155,11 @@ export default function DriverScreen() {
         });
       }),
       socketService.on('trip:offer_expired', (data: any) => {
+        console.log('[Driver][TRIP_OFFER_EXPIRED]', data);
         setOffers((prev) => prev.filter((o) => o.tripId !== data?.tripId));
       }),
       socketService.on('trip:accepted', (data: any) => {
+        console.log('[Driver][TRIP_ACCEPTED]', data);
         setOffers([]);
         if (data?.tripId) {
           api.getTrip(data.tripId).then((t) => {
@@ -148,10 +184,12 @@ export default function DriverScreen() {
     const unsubConnect = socketService.onConnect(async () => {
       // Re-join the trip room so we keep receiving status events after reconnect.
       const activeTripId = await api.getDriverActiveTrip().then((t: any) => t?.id).catch(() => null);
+      console.log('[Driver][SOCKET_RECONNECT]', { activeTripId });
       if (activeTripId) socketService.joinTrip(activeTripId);
       // Merge any pending offers we missed during the disconnect window.
       try {
         const pending = await api.getPendingOffers();
+        console.log('[Driver][PENDING_OFFERS]', { count: pending?.length || 0, pending });
         if (pending && pending.length > 0) {
           setOffers((prev) => {
             const fresh = pending.filter((o: any) => !prev.some((p) => p.tripId === o.tripId));
@@ -170,7 +208,7 @@ export default function DriverScreen() {
       unsubConnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    }, [sendDriverLocation]);
 
   // ---- Toggles ----------------------------------------------------------------
   const toggleOnline = useCallback(async () => {
@@ -197,7 +235,7 @@ export default function DriverScreen() {
       if (next) {
         socketService.emit('driver:status', { isOnline: true });
         if (coords) {
-          socketService.emit('driver:location', coords);
+          socketService.emit('driver:location', { ...coords, heading: headingRef.current });
         }
       } else {
         socketService.emit('driver:status', { isOnline: false });
@@ -216,6 +254,7 @@ export default function DriverScreen() {
     const next = !isAccepting;
     try {
       await api.updateDriverStatus({ isAccepting: next });
+      console.log('[Driver][ACCEPTING_TOGGLE]', { next, online: isOnline, selectedRoute });
       setIsAccepting(next);
       socketService.emit('driver:status', { isAccepting: next });
     } catch (e: any) {
@@ -224,6 +263,30 @@ export default function DriverScreen() {
       setToggleBusy(null);
     }
   }, [isAccepting, isOnline, toggleBusy]);
+
+  const chooseRoutePoint = useCallback(async (latitude: number, longitude: number) => {
+    const next = { latitude, longitude, radiusKm: selectedRoute?.radiusKm || 5, active: true };
+    try {
+      await api.updateSelectedRoute(next);
+      console.log('[Driver][SELECTED_ROUTE_SAVE]', next);
+      setSelectedRoute(next);
+      setRoutePicking(false);
+    } catch (e: any) {
+      setDialog({ title: 'ذخیره مسیر منتخب ناموفق بود', message: e?.message || 'دوباره تلاش کنید' });
+    }
+  }, [selectedRoute?.radiusKm]);
+
+  const toggleSelectedRoute = useCallback(async () => {
+    if (!selectedRoute) { setRoutePicking(true); return; }
+    const next = { ...selectedRoute, active: !selectedRoute.active };
+    try {
+      await api.updateSelectedRoute(next);
+      console.log('[Driver][SELECTED_ROUTE_TOGGLE]', next);
+      setSelectedRoute(next);
+    } catch (e: any) {
+      setDialog({ title: 'تغییر مسیر منتخب ناموفق بود', message: e?.message || 'دوباره تلاش کنید' });
+    }
+  }, [selectedRoute]);
 
   // ---- Offer accept/reject — server payload is { tripId, accepted } ------------
   const respondToOffer = useCallback((accepted: boolean) => {
@@ -337,45 +400,34 @@ export default function DriverScreen() {
 
   // ---- Map data -----------------------------------------------------------------
   const markers = useMemo(() => {
-    if (!trip) return [];
-    const m = [
+    const m: any[] = [];
+    if (trip) m.push(
       { id: 'origin', latitude: trip.originLat, longitude: trip.originLng, color: COLORS.pinOrigin, label: 'مبدأ' },
       { id: 'dest', latitude: trip.destLat, longitude: trip.destLng, color: COLORS.pinDest, label: 'مقصد' },
-    ];
+    );
+    if (selectedRoute) m.push({ id: 'selected-route', latitude: selectedRoute.latitude, longitude: selectedRoute.longitude, color: COLORS.success, label: 'مسیر منتخب' });
     return m;
-  }, [trip?.id, trip?.originLat, trip?.originLng, trip?.destLat, trip?.destLng]);
+  }, [trip?.id, trip?.originLat, trip?.originLng, trip?.destLat, trip?.destLng, selectedRoute]);
 
-  // Prefer the real road geometry captured at trip creation; when the
-  // provider returned none, draw a smooth decorative arc — never a straight
-  // line presented as a route.
+  // Use only the encoded road geometry captured at trip creation.
   const polyline = useMemo(() => {
     if (!trip) return null;
     if (trip.routeGeoJson) {
-      const decoded = thinPolyline(decodePolyline(trip.routeGeoJson));
+      const decoded = decodePolyline(trip.routeGeoJson);
       if (decoded.length > 1) {
         return { coordinates: decoded, color: COLORS.pinOrigin, to: COLORS.pinDest, width: 5 };
       }
     }
-    return {
-      coordinates: makeArc(
-        { latitude: trip.originLat, longitude: trip.originLng },
-        { latitude: trip.destLat, longitude: trip.destLng }
-      ),
-      color: COLORS.pinOrigin,
-      to: COLORS.pinDest,
-      width: 5,
-    };
+    return null;
   }, [trip?.id, trip?.originLat, trip?.originLng, trip?.destLat, trip?.destLng, trip?.routeGeoJson]);
 
   useEffect(() => {
     if (trip) {
-      mapRef.current?.fitToCoordinates(
-        [
-          { latitude: trip.originLat, longitude: trip.originLng },
-          { latitude: trip.destLat, longitude: trip.destLng },
-        ],
-        100
-      );
+      const route = trip.routeGeoJson ? decodePolyline(trip.routeGeoJson) : [];
+      mapRef.current?.fitToCoordinates(route.length > 1 ? route : [
+        { latitude: trip.originLat, longitude: trip.originLng },
+        { latitude: trip.destLat, longitude: trip.destLng },
+      ], 140);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trip?.id, trip?.status]);
@@ -395,13 +447,15 @@ export default function DriverScreen() {
     <View style={s.container}>
       {/* Map */}
       <View style={s.mapArea}>
-        <CabMap
+          <CabMap
           mapRef={mapRef}
           initialRegion={{ latitude: trip?.originLat ?? 35.6892, longitude: trip?.originLng ?? 51.389, zoom: 13 }}
           markers={markers}
           polyline={polyline}
-          showCenterPin={false}
-        />
+            showCenterPin={false}
+            onPress={routePicking ? chooseRoutePoint : undefined}
+            circle={selectedRoute?.active ? { latitude: selectedRoute.latitude, longitude: selectedRoute.longitude, radiusKm: selectedRoute.radiusKm, color: COLORS.success } : null}
+          />
       </View>
 
       {/* Header */}
@@ -518,7 +572,8 @@ export default function DriverScreen() {
 
       {/* Active trip card */}
       {trip && offers.length === 0 ? (
-        <View style={[s.tripCard, { bottom: insets.bottom + 190 }]}>
+        <View style={[s.tripCard, { paddingBottom: insets.bottom + SPACING.lg }]}> 
+          <View style={s.sheetHandle} />
           <View style={s.tripHeader}>
             <View style={s.tripBadge}>
               <CarIcon size={18} color={COLORS.brand} />
@@ -532,7 +587,7 @@ export default function DriverScreen() {
           {trip.passenger ? (
             <View style={s.tripPhoneRow}>
               <PhoneIcon size={13} color={COLORS.brand} />
-              <Text style={s.tripPhone}>{trip.passenger.phone}</Text>
+              <Text style={s.tripPhone}>{toPersianDigits(trip.passenger.phone ?? '')}</Text>
             </View>
           ) : null}
           <OfferRow label="مبدأ" value={trip.originAddress || '—'} />
@@ -574,7 +629,18 @@ export default function DriverScreen() {
       ) : null}
 
       {/* Bottom control bar */}
-      <View style={[s.bottomBar, { paddingBottom: insets.bottom + 14 }]}>
+      {!trip ? <View style={[s.bottomBar, { paddingBottom: insets.bottom + 14 }]}> 
+        {!trip ? (
+          <Pressable style={s.selectedRouteBtn} onPress={routePicking ? undefined : selectedRoute?.active ? () => setRoutePicking(true) : toggleSelectedRoute}>
+            <Text style={s.selectedRouteText}>{routePicking ? 'روی نقشه نقطه مسیر منتخب را انتخاب کنید' : selectedRoute?.active ? 'تغییر نقطه مسیر منتخب' : 'مسیر منتخب — انتخاب محدوده'}</Text>
+          </Pressable>
+        ) : null}
+        {!trip && selectedRoute?.active && !routePicking ? (
+          <Pressable style={s.allTripsBtn} onPress={toggleSelectedRoute}>
+            <Text style={s.allTripsText}>خروج از مسیر منتخب و دریافت همه سفرها</Text>
+          </Pressable>
+        ) : null}
+        {routePicking ? <Pressable style={s.routeCancel} onPress={() => setRoutePicking(false)}><Text style={s.routeCancelText}>انصراف</Text></Pressable> : null}
         {!isOnline ? (
           <Pressable
             style={({ pressed }) => [s.bottomBtnFull, pressed && { opacity: 0.92 }]}
@@ -584,7 +650,7 @@ export default function DriverScreen() {
             {toggleBusy === 'online' ? (
               <ActivityIndicator color="#fff" size="small" />
             ) : (
-              <Text style={s.bottomBtnText}>ورود به خط — آماده دریافت سفر</Text>
+              <Text style={s.bottomBtnText}>ورود به مدار — آماده دریافت سفر</Text>
             )}
           </Pressable>
         ) : (
@@ -596,7 +662,7 @@ export default function DriverScreen() {
               onPress={toggleOnline}
               disabled={!!toggleBusy || !!trip}
             >
-              {toggleBusy === 'online' ? <ActivityIndicator color="#fff" size="small" /> : <Text style={s.bottomBtnText}>غیرفعال</Text>}
+               {toggleBusy === 'online' ? <ActivityIndicator color="#fff" size="small" /> : <Text style={s.bottomBtnText}>خروج از مدار</Text>}
             </Pressable>
             <Pressable
               style={({ pressed }) => [s.bottomBtn, isAccepting ? s.btnAccepting : s.btnNotAccepting, pressed && !trip && { opacity: 0.92 }, trip && { opacity: 0.5 }]}
@@ -614,7 +680,7 @@ export default function DriverScreen() {
             {isAccepting ? 'در انتظار درخواست سفر...' : 'برای دریافت درخواست، حالت دریافت را فعال کنید'}
           </Text>
         ) : null}
-      </View>
+      </View> : null}
 
       <ConfirmDialog
         visible={!!dialog}
@@ -938,16 +1004,17 @@ const s = StyleSheet.create({
   offerActions: { flexDirection: 'row-reverse', gap: SPACING.sm, marginTop: SPACING.md },
 
   tripCard: {
-    position: 'absolute', left: SPACING.lg, right: SPACING.lg, zIndex: 60,
-    backgroundColor: '#FFFFFF', borderRadius: 24,
+    position: 'absolute', left: 0, right: 0, bottom: 0, zIndex: 60,
+    backgroundColor: '#FFFFFF', borderTopLeftRadius: 28, borderTopRightRadius: 28,
     padding: SPACING.xl,
     shadowColor: '#0F172A',
     shadowOffset: { width: 0, height: 12 },
     shadowOpacity: 0.16,
     shadowRadius: 24,
     elevation: 16,
-    borderWidth: 1, borderColor: '#E2E8F0',
+    borderTopWidth: 1, borderColor: '#E2E8F0',
   },
+  sheetHandle: { width: 40, height: 4, borderRadius: 2, backgroundColor: '#CBD5E1', alignSelf: 'center', marginBottom: SPACING.md },
   tripHeader: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between', marginBottom: SPACING.sm },
   tripBadge: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6 },
   tripBadgeText: { fontFamily: FONTS.bold, fontSize: 14, color: COLORS.text },
@@ -1029,7 +1096,7 @@ const s = StyleSheet.create({
     flex: 1, borderRadius: RADIUS.lg, paddingVertical: 14,
     alignItems: 'center', justifyContent: 'center',
   },
-  btnOnline: { backgroundColor: '#0F172A' },
+  btnOnline: { backgroundColor: COLORS.success },
   btnAccepting: {
     backgroundColor: COLORS.brand,
     shadowColor: COLORS.brand,
@@ -1041,6 +1108,12 @@ const s = StyleSheet.create({
   btnNotAccepting: { backgroundColor: '#94A3B8' },
   bottomBtnText: { fontFamily: FONTS.bold, fontSize: 14, color: '#fff' },
   idleText: { fontFamily: FONTS.medium, fontSize: 12, color: COLORS.textSecondary, marginTop: 10, textAlign: 'center' },
+  selectedRouteBtn: { width: '100%', backgroundColor: COLORS.surface, borderRadius: RADIUS.lg, borderWidth: 1, borderColor: COLORS.success, paddingVertical: 11, alignItems: 'center', marginBottom: SPACING.sm },
+  selectedRouteText: { fontFamily: FONTS.bold, fontSize: 13, color: COLORS.success, textAlign: 'center' },
+  routeCancel: { marginBottom: SPACING.sm, paddingVertical: 4 },
+  routeCancelText: { fontFamily: FONTS.medium, fontSize: 12, color: COLORS.textSecondary },
+  allTripsBtn: { width: '100%', backgroundColor: COLORS.success, borderRadius: RADIUS.lg, paddingVertical: 11, alignItems: 'center', marginBottom: SPACING.sm },
+  allTripsText: { fontFamily: FONTS.bold, fontSize: 13, color: '#fff' },
 
   centerWrap: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: COLORS.bg, padding: SPACING.xxl },
   centerText: { fontFamily: FONTS.regular, fontSize: 14, color: COLORS.textSecondary, marginTop: 16, textAlign: 'center' },

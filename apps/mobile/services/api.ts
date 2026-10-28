@@ -11,12 +11,19 @@ class ApiService {
   setToken(t: string | null) { this.token = t; }
 
   private async request<T>(path: string, opts: RequestInit = {}): Promise<T> {
+    const isPublicAuthRequest = path === '/auth/send-otp' || path === '/auth/verify-otp';
+    if (!this.token && !isPublicAuthRequest) {
+      console.warn('[API][AUTH_GUARD]', opts.method || 'GET', path, 'No token provided');
+      this.unauthorizedHandler?.();
+      throw new Error('No token provided');
+    }
     const h: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.token) h['Authorization'] = `Bearer ${this.token}`;
 
     let res: Response;
     try {
       res = await fetch(`${API_URL}${path}`, { ...opts, headers: h });
+      console.log('[API]', opts.method || 'GET', path, res.status);
     } catch (e: any) {
       // Server unreachable / offline / dev-server bundle failed to load.
       console.warn('[API] Network error', path, e?.message || e);
@@ -80,13 +87,19 @@ class ApiService {
   // Wallet
   getWallet = () => this.request<{ balance: number; transactions: any[] }>('/wallet');
 
-  topupWallet = () =>
-    this.request<any>('/wallet/topup', { method: 'POST', body: JSON.stringify({}) });
+  topupWallet = (amount: number) =>
+    this.request<{ balance: number }>('/wallet/topup', { method: 'POST', body: JSON.stringify({ amount }) });
 
   getDriverStatus = () => this.request<any>('/drivers/status');
 
-  updateDriverStatus = (data: { isOnline?: boolean; isAccepting?: boolean; latitude?: number; longitude?: number }) =>
+  getNearbyDrivers = (latitude: number, longitude: number) =>
+    this.request<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number }>>(`/drivers/nearby?lat=${latitude}&lng=${longitude}`);
+
+  updateDriverStatus = (data: { isOnline?: boolean; isAccepting?: boolean; latitude?: number; longitude?: number; heading?: number }) =>
     this.request<any>('/drivers/status', { method: 'PUT', body: JSON.stringify(data) });
+
+  updateSelectedRoute = (data: { latitude: number | null; longitude: number | null; radiusKm: number; active: boolean }) =>
+    this.request<any>('/drivers/selected-route', { method: 'PUT', body: JSON.stringify(data) });
 
   getDriverActiveTrip = () => this.request<any>('/drivers/active-trip');
 
