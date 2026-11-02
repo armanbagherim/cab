@@ -4,7 +4,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View, Text, TextInput, StyleSheet, Pressable, ActivityIndicator, KeyboardAvoidingView, Platform,
 } from 'react-native';
-import { ArrowRightIcon, PersonIcon, PhoneIcon, CarIcon, CashIcon, HistoryIcon } from '../components/Icons';
+import { ArrowRightIcon, PersonIcon, PhoneIcon, CarIcon, CashIcon, HistoryIcon, ArrowLeftIcon } from '../components/Icons';
+import BackButton from '../components/BackButton';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { api } from '../services/api';
 import { useAuth } from '../context/AuthContext';
@@ -62,9 +63,7 @@ export default function ProfileScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.headerRow}>
-        <Pressable style={styles.backBtn} onPress={() => router.back()} accessibilityLabel="بازگشت">
-          <ArrowRightIcon size={18} />
-        </Pressable>
+        <BackButton onPress={() => router.back()} />
         <Text style={styles.title}>پروفایل</Text>
         <View style={{ width: 40 }} />
       </View>
@@ -139,7 +138,8 @@ export default function ProfileScreen() {
               >
                 <CashIcon size={18} color={COLORS.brand} />
                 <Text style={styles.linkText}>کیف پول</Text>
-                <ArrowRightIcon size={16} color={COLORS.textTertiary} />
+                {/* Row chevrons follow the RTL reading direction (point left). */}
+                <ArrowLeftIcon size={16} color={COLORS.textTertiary} />
               </Pressable>
             ) : null}
             <Pressable
@@ -148,7 +148,7 @@ export default function ProfileScreen() {
             >
               <HistoryIcon size={18} color={COLORS.brand} />
               <Text style={styles.linkText}>سفرهای من</Text>
-              <ArrowRightIcon size={16} color={COLORS.textTertiary} />
+              <ArrowLeftIcon size={16} color={COLORS.textTertiary} />
             </Pressable>
 
             {editing ? (
@@ -191,11 +191,6 @@ const styles = StyleSheet.create({
   headerRow: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: SPACING.md,
     paddingHorizontal: SPACING.lg, paddingVertical: SPACING.md,
-  },
-  backBtn: {
-    width: 40, height: 40, borderRadius: RADIUS.sm,
-    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border,
-    justifyContent: 'center', alignItems: 'center',
   },
   title: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },

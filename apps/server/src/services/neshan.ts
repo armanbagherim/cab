@@ -9,6 +9,9 @@ async function fetchNeshan(url: string): Promise<Response> {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
+    // Diagnostics only: URL carries no secret (the API key is a header) and
+    // the body snippet never contains user credentials.
+    console.error('[NESHAN] upstream error', { url, status: res.status, body: body.slice(0, 200) });
     throw new Error(`Neshan API error: ${res.status} ${body.slice(0, 200)}`);
   }
   return res;

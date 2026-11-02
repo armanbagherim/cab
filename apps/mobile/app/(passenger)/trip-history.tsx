@@ -4,7 +4,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, RefreshControl,
 } from 'react-native';
-import { ArrowRightIcon, HistoryIcon, CarIcon, CloseIcon, AlertIcon } from '../../components/Icons';
+import { HistoryIcon, CarIcon, CloseIcon, AlertIcon } from '../../components/Icons';
+import BackButton from '../../components/BackButton';
 import { api } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
@@ -100,9 +101,7 @@ export default function TripHistoryScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.headerRow}>
-        <Pressable style={styles.backBtn} onPress={() => router.back()} accessibilityLabel="بازگشت">
-          <ArrowRightIcon size={18} />
-        </Pressable>
+        <BackButton onPress={() => router.back()} />
         <Text style={styles.title}>سفرهای من</Text>
         <View style={{ width: 40 }} />
       </View>
@@ -163,11 +162,6 @@ const styles = StyleSheet.create({
   headerRow: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: SPACING.md,
     paddingHorizontal: SPACING.lg, paddingVertical: SPACING.md,
-  },
-  backBtn: {
-    width: 40, height: 40, borderRadius: RADIUS.sm,
-    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border,
-    justifyContent: 'center', alignItems: 'center',
   },
   title: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text },
   summaryCard: {

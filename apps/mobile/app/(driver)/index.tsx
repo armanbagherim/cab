@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'expo-router';
+import { I18nManager } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View, Text, StyleSheet, Pressable, ActivityIndicator, Linking, Modal, Platform, ScrollView,
@@ -9,11 +10,14 @@ import { CabMap, NeshanMapRef } from '../../components/CabMap';
 import { api } from '../../services/api';
 import { socketService } from '../../services/socket';
 import { useAuth } from '../../context/AuthContext';
-import { LogoutIcon, PersonIcon, PhoneIcon, CarIcon, CloseIcon, HistoryIcon } from '../../components/Icons';
+import { LogoutIcon, PersonIcon, CarIcon, CloseIcon, HistoryIcon, MenuIcon } from '../../components/Icons';
+import PopoverMenu from '../../components/PopoverMenu';
+import CallButton from '../../components/CallButton';
 import ConfirmDialog from '../../components/ConfirmDialog';
-import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman, toPersianDigits } from '../../utils/theme';
+import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
 import { decodePolyline } from '../../utils/geo';
 import { Trip, TripStatus } from '../../types';
+import { initNotifications, notifyEvent } from '../../services/notifications';
 
 /** Driver action buttons follow the server's real transition map:
  *  ACCEPTED → DRIVER_ARRIVING → DRIVER_ARRIVED → IN_PROGRESS → COMPLETED.
@@ -43,7 +47,7 @@ function bearingBetween(from: { latitude: number; longitude: number }, to: { lat
 export default function DriverScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { user, logout } = useAuth();
+  const { user, isLoading, logout } = useAuth();
   const mapRef = useRef<NeshanMapRef>(null);
 
   const [isOnline, setIsOnline] = useState(false);
@@ -57,6 +61,7 @@ export default function DriverScreen() {
   const [actionBusy, setActionBusy] = useState(false);
   const [dialog, setDialog] = useState<null | { title: string; message?: string; danger?: boolean; onConfirm?: () => void; confirmText?: string }>(null);
   const [navSheetVisible, setNavSheetVisible] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [routePicking, setRoutePicking] = useState(false);
   const [selectedRoute, setSelectedRoute] = useState<{ latitude: number; longitude: number; radiusKm: number; active: boolean } | null>(null);
 
@@ -79,10 +84,21 @@ export default function DriverScreen() {
 
   const driverName = user ? `${user.firstName} ${user.lastName}`.trim() : 'سفیر';
 
+  // Logout safety net: session cleanup lives in AuthContext, but navigation
+  // is also enforced here so the app always lands on the Super App home page
+  // (not the cab section) the moment the user becomes signed out.
+  useEffect(() => {
+    if (!isLoading && !user) router.replace('/home' as any);
+  }, [user, isLoading, router]);
+
   // ---- Init ------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
     let watching: Location.LocationSubscription | null = null;
+
+    initNotifications().then((limitations) => {
+      if (limitations.length) console.warn('[Driver][NOTIFICATIONS_LIMITED]', limitations);
+    }).catch((error) => console.warn('[Driver][NOTIFICATIONS_INIT_ERROR]', error));
 
     (async () => {
       try {
@@ -147,9 +163,15 @@ export default function DriverScreen() {
       socketService.on('trip:offer', (data: any) => {
         console.log('[Driver][TRIP_OFFER]', data);
         if (!data?.tripId) return;
+        notifyEvent({
+          tag: `offer:${data.offerId || data.tripId}`,
+          title: 'سفر جدید',
+          body: data.originAddress || 'درخواست سفر جدید دریافت شد',
+        });
         setOffers((prev) => {
           if (prev.some((o) => o.tripId === data.tripId)) return prev;
-          const next = [...prev, { ...data, expiresAt: Date.now() + 15000 }];
+          const serverExpiry = data.offerExpiresAt ? Date.parse(data.offerExpiresAt) : NaN;
+          const next = [...prev, { ...data, expiresAt: Number.isFinite(serverExpiry) ? serverExpiry : Date.now() + 10000 }];
           // Nearest pickup first — real driver distance from the offer payload.
           return next.sort((a, b) => (a.driverDistanceKm ?? Infinity) - (b.driverDistanceKm ?? Infinity));
         });
@@ -194,7 +216,10 @@ export default function DriverScreen() {
           setOffers((prev) => {
             const fresh = pending.filter((o: any) => !prev.some((p) => p.tripId === o.tripId));
             if (!fresh.length) return prev;
-            const merged = [...prev, ...fresh.map((o: any) => ({ ...o, expiresAt: Date.now() + 15000 }))];
+            const merged = [...prev, ...fresh.map((o: any) => {
+              const serverExpiry = o.offerExpiresAt ? Date.parse(o.offerExpiresAt) : NaN;
+              return { ...o, expiresAt: Number.isFinite(serverExpiry) ? serverExpiry : Date.now() + 10000 };
+            })];
             return merged.sort((a, b) => (a.driverDistanceKm ?? Infinity) - (b.driverDistanceKm ?? Infinity));
           });
         }
@@ -292,7 +317,7 @@ export default function DriverScreen() {
   const respondToOffer = useCallback((accepted: boolean) => {
     const current = offers[offerIndex];
     if (!current) return;
-    socketService.emit('trip:respond', { tripId: current.tripId, accepted });
+    socketService.emit('trip:respond', { tripId: current.tripId, offerId: current.offerId, accepted });
     // Optimistically drop it locally; the server confirms via events.
     setOffers((prev) => prev.filter((o) => o.tripId !== current.tripId));
     setOfferIndex(0);
@@ -469,30 +494,50 @@ export default function DriverScreen() {
             </Text>
           </View>
         </View>
+        {/* Single menu button — Trips / Profile / Logout live in a popover
+            instead of a row of buttons beside the driver status card. */}
         <View style={s.headerActions}>
           <Pressable
-            accessibilityLabel="سفرهای من"
-            onPress={() => router.push('/(passenger)/trip-history' as any)}
+            accessibilityLabel="منو"
+            accessibilityRole="button"
+            onPress={() => setMenuOpen(true)}
             style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
           >
-            <HistoryIcon size={20} color={COLORS.textSecondary} />
-          </Pressable>
-          <Pressable
-            accessibilityLabel="پروفایل"
-            onPress={() => router.push('/profile' as any)}
-            style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
-          >
-            <PersonIcon size={20} color={COLORS.textSecondary} />
-          </Pressable>
-          <Pressable
-            accessibilityLabel="خروج از حساب"
-            onPress={handleLogout}
-            style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
-          >
-            <LogoutIcon size={20} color={COLORS.error} />
+            <MenuIcon size={22} color={COLORS.textSecondary} />
           </Pressable>
         </View>
       </View>
+
+      <PopoverMenu
+        visible={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        // The actions cluster is the last child of a row-reverse header:
+        // on RTL devices (Persian) it ends up on the physical right, on LTR
+        // hosts on the left. Match the popover side to the real trigger side.
+        side={I18nManager.isRTL ? 'right' : 'left'}
+        top={insets.top + 62}
+        items={[
+          {
+            key: 'trips',
+            label: 'سفرهای من',
+            icon: <HistoryIcon size={20} color={COLORS.textSecondary} />,
+            onPress: () => router.push('/(passenger)/trip-history' as any),
+          },
+          {
+            key: 'profile',
+            label: 'پروفایل',
+            icon: <PersonIcon size={20} color={COLORS.textSecondary} />,
+            onPress: () => router.push('/profile' as any),
+          },
+          {
+            key: 'logout',
+            label: 'خروج از حساب',
+            icon: <LogoutIcon size={20} color={COLORS.error} />,
+            danger: true,
+            onPress: handleLogout,
+          },
+        ]}
+      />
 
       {/* Incoming requests — swipeable carousel, one countdown per request */}
       {offers.length > 0 ? (
@@ -584,12 +629,6 @@ export default function DriverScreen() {
             ) : null}
           </View>
           <OfferRow label="مسافر" value={trip.passenger ? `${trip.passenger.firstName} ${trip.passenger.lastName}` : '—'} />
-          {trip.passenger ? (
-            <View style={s.tripPhoneRow}>
-              <PhoneIcon size={13} color={COLORS.brand} />
-              <Text style={s.tripPhone}>{toPersianDigits(trip.passenger.phone ?? '')}</Text>
-            </View>
-          ) : null}
           <OfferRow label="مبدأ" value={trip.originAddress || '—'} />
           <OfferRow label="مقصد" value={trip.destAddress || '—'} />
           <View style={s.tripFareRow}>
@@ -597,8 +636,11 @@ export default function DriverScreen() {
             <Text style={s.tripFare}>{formatToman(trip.estimatedPrice)} تومان</Text>
           </View>
 
-          {/* External navigation — single button opens app-picker sheet */}
+          {/* Actions: navigation + direct call to the passenger (dialer).
+              The raw number is no longer displayed — the Call button uses
+              the real phone from the trip data and hides when it is missing. */}
           <View style={s.tripActions}>
+            <CallButton phone={trip.passenger?.phone} />
             <Pressable
               style={({ pressed }) => [s.navBtn, pressed && { opacity: 0.88 }]}
               onPress={() => setNavSheetVisible(true)}
@@ -1023,8 +1065,6 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(15, 169, 88, 0.1)', borderRadius: RADIUS.full,
     overflow: 'hidden', paddingVertical: 4, paddingHorizontal: 12,
   },
-  tripPhoneRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 6, marginBottom: 6 },
-  tripPhone: { fontFamily: FONTS.medium, fontSize: 12, color: COLORS.textSecondary, writingDirection: 'ltr' as any },
   tripFareRow: {
     flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between',
     marginTop: 10, backgroundColor: '#F8FAFC', borderRadius: RADIUS.lg,

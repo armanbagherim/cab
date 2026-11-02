@@ -1,10 +1,11 @@
 import { Router, Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { authMiddleware, requireRole } from '../middleware/auth';
 import prisma from '../utils/prisma';
 import { validateTehranCoord, calculatePrice, calculateDistance } from '../utils/helpers';
 import { getRoute, reverseGeocode, searchAddress, searchAddressPlus, searchPoi } from '../services/neshan';
-import { io } from '../socket/handler';
+import { io, isDriverConnected } from '../socket/handler';
 import { config } from '../config';
 
 const router = Router();
@@ -28,18 +29,60 @@ const createTripSchema = z.object({
 
 // Estimate price and route
 router.post('/estimate', authMiddleware, async (req: Request, res: Response) => {
+  // Diagnostic context reused by every log line below (never contains the
+  // bearer token — Authorization headers are not logged anywhere).
+  const coords = {
+    originLat: req.body?.originLat,
+    originLng: req.body?.originLng,
+    destLat: req.body?.destLat,
+    destLng: req.body?.destLng,
+  };
   try {
-    const body = estimateSchema.parse(req.body);
+    const parsed = estimateSchema.safeParse(req.body);
+    if (!parsed.success) {
+      console.warn('[trip:estimate] request validation failed', {
+        ...coords,
+        userId: req.user?.userId,
+        issues: parsed.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`),
+      });
+      res.status(400).json({ success: false, error: parsed.error.errors[0].message });
+      return;
+    }
+    const body = parsed.data;
 
     if (!validateTehranCoord(body.originLat, body.originLng) ||
         !validateTehranCoord(body.destLat, body.destLng)) {
+      console.warn('[trip:estimate] coordinates outside Tehran bounds', coords);
       res.status(400).json({ success: false, error: 'مختصات خارج از محدوده مجاز تهران است' });
       return;
     }
 
-    const routeResult = await getRoute(body.originLat, body.originLng, body.destLat, body.destLng);
+    // Upstream routing failures must NOT surface as a naked 500 — mirror the
+    // create-trip contract (502) so the client can offer a retry. This was
+    // the actual root cause of the reported HTTP 500: any Neshan API failure
+    // (rate limit 429, invalid/expired service key 401/403, network error)
+    // thrown out of getRoute and fell straight into the generic catch.
+    let routeResult;
+    try {
+      routeResult = await getRoute(body.originLat, body.originLng, body.destLat, body.destLng);
+    } catch (e: any) {
+      console.error('[trip:estimate] routing upstream failed', {
+        ...coords,
+        userId: req.user?.userId,
+        error: e?.message || String(e),
+      });
+      res.status(502).json({ success: false, error: 'خطا در دریافت مسیر. لطفاً دوباره تلاش کنید' });
+      return;
+    }
 
     if (routeResult.status !== 'OK' || routeResult.distance <= 0) {
+      console.warn('[trip:estimate] no usable route from upstream', {
+        ...coords,
+        userId: req.user?.userId,
+        upstreamStatus: routeResult.status,
+        upstreamDistance: routeResult.distance,
+        routesCount: Array.isArray(routeResult.routes) ? routeResult.routes.length : 0,
+      });
       res.status(400).json({ success: false, error: 'مسیریابی ناموفق بود' });
       return;
     }
@@ -51,8 +94,18 @@ router.post('/estimate', authMiddleware, async (req: Request, res: Response) => 
     // Get addresses (best-effort)
     let originAddress = '';
     let destAddress = '';
-    try { const o = await reverseGeocode(body.originLat, body.originLng); originAddress = o.formatted_address; } catch {}
-    try { const d = await reverseGeocode(body.destLat, body.destLng); destAddress = d.formatted_address; } catch {}
+    try {
+      const o = await reverseGeocode(body.originLat, body.originLng);
+      originAddress = o.formatted_address;
+    } catch (e: any) {
+      console.warn('[trip:estimate] origin reverse geocode failed', e?.message || e);
+    }
+    try {
+      const d = await reverseGeocode(body.destLat, body.destLng);
+      destAddress = d.formatted_address;
+    } catch (e: any) {
+      console.warn('[trip:estimate] dest reverse geocode failed', e?.message || e);
+    }
 
     res.json({
       success: true,
@@ -66,10 +119,7 @@ router.post('/estimate', authMiddleware, async (req: Request, res: Response) => 
       },
     });
   } catch (err) {
-    if (err instanceof z.ZodError) {
-      res.status(400).json({ success: false, error: err.errors[0].message });
-      return;
-    }
+    console.error('[trip:estimate] unexpected error', { ...coords, userId: req.user?.userId, error: err });
     res.status(500).json({ success: false, error: 'Internal error' });
   }
 });
@@ -191,293 +241,566 @@ router.post('/', authMiddleware, requireRole('PASSENGER'), async (req: Request, 
   }
 });
 
-const activeDispatches = new Set<string>();
+// ---------------------------------------------------------------------------
+// Dispatch core
+//
+// Design (single Node process; SQLite datasource):
+// - One dispatcher loop per trip (`dispatchers` map guards duplication).
+// - Up to `maxParallelOffers` offers can be outstanding at once; each offer
+//   has a server-side identity, expiry timestamp and its own timer.
+// - Candidates are re-selected from authoritative DB state on each refill;
+//   nothing about eligibility is cached across polls.
+// - Assignment is an atomic conditional transition (Prisma `updateMany`
+//   guarded on `driverId: null` + eligible statuses); concurrent acceptances
+//   race on affected-row count, exactly one wins. SQLite serializes writes,
+//   so no extra locking layer is needed — and none is assumed beyond that.
+// - The loop never blocks the process and never holds a DB transaction open
+//   while waiting on sockets; wakeups are event-driven with a poll fallback.
+// ---------------------------------------------------------------------------
 
-export function ensureDispatch(tripId: string): void {
-  if (activeDispatches.has(tripId)) {
-    console.log('[DISPATCH][ALREADY_RUNNING]', { tripId });
-    return;
-  }
-  activeDispatches.add(tripId);
-  findAndOfferDriver(tripId)
-    .catch((err) => console.error('[DISPATCH][ERROR]', { tripId, error: err?.message || err }))
-    .finally(() => activeDispatches.delete(tripId));
+interface OfferState {
+  offerId: string;
+  tripId: string;
+  driverId: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
-async function findAndOfferDriver(tripId: string): Promise<void> {
-  // Bounded search window (~150 s): instead of failing fast when no driver is
-  // currently in range, we keep the trip in SEARCHING and re-scan the pool
-  // every pollIntervalMs until a driver accepts or the window expires.
-  // Driver acceptance always takes precedence over any later offer.
-  const deadline = Date.now() + config.driverSearch.searchWindowMs;
-  const offerHistory = new Set<string>(); // drivers already offered this run
-  console.log('[DISPATCH][START]', { tripId, deadlineMs: config.driverSearch.searchWindowMs });
-
-  while (Date.now() < deadline) {
-    const trip = await prisma.trip.findUnique({ where: { id: tripId } });
-    if (!trip || trip.status !== 'SEARCHING') return; // cancelled / accepted / terminal
-
-    // Find eligible drivers
-    let eligibleDrivers = await prisma.driverStatus.findMany({
-      where: {
-        isOnline: true,
-        isAccepting: true,
-        isOnTrip: false,
-        latitude: { not: null },
-        longitude: { not: null },
-      },
-      orderBy: { updatedAt: 'desc' },
-    });
-
-    if (eligibleDrivers.length === 0) {
-      // Reconcile: check if any online driver has stale isOnTrip without an active ride
-      const driversToCheck = await prisma.driverStatus.findMany({
-        where: {
-          isOnline: true,
-          isAccepting: true,
-          isOnTrip: true,
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-      });
-      for (const d of driversToCheck) {
-        const liveTrip = await prisma.trip.findFirst({
-          where: {
-            driverId: d.userId,
-            status: { in: ['ACCEPTED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS'] },
-          },
-        });
-        if (!liveTrip) {
-          await prisma.driverStatus.update({
-            where: { userId: d.userId },
-            data: { isOnTrip: false },
-          });
-          eligibleDrivers.push({ ...d, isOnTrip: false });
-        }
-      }
-    }
-
-    // Progressive radius expansion keeps nearby offers first without letting a
-    // request disappear just because the first search radius is empty.
-    const radiusIndex = Math.min(
-      config.driverSearch.radiusStepsKm.length - 1,
-      Math.floor((Date.now() - (deadline - config.driverSearch.searchWindowMs)) / 30_000),
-    );
-    const searchRadiusKm = config.driverSearch.radiusStepsKm[radiusIndex];
-    const withDistance = eligibleDrivers
-      .map((d) => ({
-        ...d,
-        distance: calculateDistance(
-          trip.originLat, trip.originLng,
-          d.latitude!, d.longitude!
-        ),
-      }))
-      .sort((a, b) => {
-        const aPreferred = a.selectedActive && a.selectedLat !== null && a.selectedLng !== null
-          && calculateDistance(trip.originLat, trip.originLng, a.selectedLat, a.selectedLng) <= a.selectedRadiusKm;
-        const bPreferred = b.selectedActive && b.selectedLat !== null && b.selectedLng !== null
-          && calculateDistance(trip.originLat, trip.originLng, b.selectedLat, b.selectedLng) <= b.selectedRadiusKm;
-        return Number(bPreferred) - Number(aPreferred) || a.distance - b.distance;
-      });
-    const preferred = withDistance.filter((d) => d.selectedActive && d.selectedLat !== null && d.selectedLng !== null
-      && calculateDistance(trip.originLat, trip.originLng, d.selectedLat, d.selectedLng) <= d.selectedRadiusKm);
-    const nearby = withDistance
-      .filter((d) => d.distance <= searchRadiusKm);
-
-    const candidates = preferred.length > 0
-      ? [...preferred, ...nearby.filter((driver) => !preferred.some((item) => item.userId === driver.userId))]
-      : radiusIndex === config.driverSearch.radiusStepsKm.length - 1
-        ? eligibleDrivers
-          .map((d) => ({
-            ...d,
-            distance: calculateDistance(
-              trip.originLat, trip.originLng,
-              d.latitude!, d.longitude!
-            ),
-          }))
-           .sort((a, b) => {
-             const aPreferred = a.selectedActive && a.selectedLat !== null && a.selectedLng !== null
-               && calculateDistance(trip.originLat, trip.originLng, a.selectedLat, a.selectedLng) <= a.selectedRadiusKm;
-             const bPreferred = b.selectedActive && b.selectedLat !== null && b.selectedLng !== null
-               && calculateDistance(trip.originLat, trip.originLng, b.selectedLat, b.selectedLng) <= b.selectedRadiusKm;
-             return Number(bPreferred) - Number(aPreferred) || a.distance - b.distance;
-           })
-         : [];
-
-    console.log('[DISPATCH][SCAN]', {
-      tripId, status: trip.status, radiusKm: searchRadiusKm, radiusIndex,
-      preferred: preferred.map((d) => ({ id: d.userId, distanceKm: d.distance, selectedLat: d.selectedLat, selectedLng: d.selectedLng, selectedRadiusKm: d.selectedRadiusKm })),
-      eligible: eligibleDrivers.map((d) => ({ id: d.userId, online: d.isOnline, accepting: d.isAccepting, onTrip: d.isOnTrip, lat: d.latitude, lng: d.longitude })),
-      candidates: candidates.map((d) => ({ id: d.userId, distanceKm: d.distance, selectedActive: d.selectedActive, selectedLat: d.selectedLat, selectedLng: d.selectedLng, selectedRadiusKm: d.selectedRadiusKm })),
-      offeredBefore: [...offerHistory],
-    });
-
-    const pool = candidates
-      .filter((d) => !offerHistory.has(d.userId));
-
-    for (const driver of pool) {
-      const tripCheck = await prisma.trip.findUnique({ where: { id: tripId } });
-      if (!tripCheck || !['SEARCHING', 'OFFERED'].includes(tripCheck.status)) return;
-
-      offerHistory.add(driver.userId);
-      trackOffer(driver.userId, tripId);
-      console.log('[DISPATCH][OFFER]', { tripId, driverId: driver.userId, distanceKm: driver.distance, selectedActive: driver.selectedActive, selectedLat: driver.selectedLat, selectedLng: driver.selectedLng, selectedRadiusKm: driver.selectedRadiusKm });
-
-      // Mark as OFFERED
-      await prisma.trip.update({
-        where: { id: tripId },
-        data: { status: 'OFFERED' },
-      });
-
-      io.to(`driver:${driver.userId}`).emit('trip:offer', {
-        tripId,
-        originLat: trip.originLat,
-        originLng: trip.originLng,
-        originAddress: trip.originAddress,
-        destLat: trip.destLat,
-        destLng: trip.destLng,
-        destAddress: trip.destAddress,
-        distanceKm: trip.distanceKm,
-        durationMin: trip.durationMin,
-        estimatedPrice: trip.estimatedPrice,
-        driverDistanceKm: Math.round(driver.distance * 10) / 10,
-      });
-
-      // Wait for acceptance with timeout
-      const accepted = await waitForDriverResponse(tripId, driver.userId, config.driverSearch.timeoutMs);
-
-      if (accepted) {
-        console.log('[DISPATCH][ACCEPTED]', { tripId, driverId: driver.userId });
-        // Double check trip is still eligible before assigning
-        const liveTrip = await prisma.trip.findUnique({ where: { id: tripId } });
-        if (!liveTrip || liveTrip.status !== 'OFFERED') return;
-
-        // Assign trip to this driver
-        await prisma.trip.update({
-          where: { id: tripId },
-          data: {
-            driverId: driver.userId,
-            status: 'ACCEPTED',
-            acceptedAt: new Date(),
-          },
-        });
-        await prisma.driverStatus.update({
-          where: { userId: driver.userId },
-          data: { isOnTrip: true },
-        });
-
-        io.to(`trip:${tripId}`).emit('trip:accepted', {
-          tripId,
-          driverId: driver.userId,
-          status: 'ACCEPTED',
-        });
-        io.to(`driver:${driver.userId}`).emit('trip:accepted', { tripId, status: 'ACCEPTED' });
-        // Driver is now busy: all other pending offers to them expire at once.
-        expireOtherOffers(driver.userId, tripId);
-        return;
-      }
-
-      // Driver declined or timed out, notify and try next
-      untrackOffer(driver.userId, tripId);
-      console.log('[DISPATCH][NO_ACCEPT]', { tripId, driverId: driver.userId });
-      io.to(`driver:${driver.userId}`).emit('trip:offer_expired', { tripId });
-
-      // If the trip was cancelled while waiting, stop
-      const checkAfterWait = await prisma.trip.findUnique({ where: { id: tripId } });
-      if (!checkAfterWait || checkAfterWait.status !== 'OFFERED') return;
-
-      // Revert status to SEARCHING so passenger sees search continues and next driver can be offered
-      await prisma.trip.update({
-        where: { id: tripId },
-        data: { status: 'SEARCHING' },
-      });
-      io.to(`trip:${tripId}`).emit('trip:status', { tripId, status: 'SEARCHING' });
-
-      if (Date.now() >= deadline) break;
-    }
-
-    if (Date.now() >= deadline) break;
-
-    // Reset offerHistory if all available drivers were offered once, so they can be re-contacted
-    if (pool.length === 0 && candidates.length > 0) {
-      offerHistory.clear();
-    }
-
-    // Nothing actionable this pass — return to SEARCHING so the passenger and
-    // driver pool see an honest pending state, then re-scan for new drivers.
-    const tripCheck = await prisma.trip.findUnique({ where: { id: tripId } });
-    if (!tripCheck) return;
-    if (!['SEARCHING', 'OFFERED'].includes(tripCheck.status)) return;
-    if (tripCheck.status === 'OFFERED') {
-      await prisma.trip.update({
-        where: { id: tripId },
-        data: { status: 'SEARCHING' },
-      });
-      io.to(`trip:${tripId}`).emit('trip:status', { tripId, status: 'SEARCHING' });
-    }
-
-    await new Promise((r) => setTimeout(r, config.driverSearch.pollIntervalMs));
-  }
-
-  // Window expired with no acceptance — honest terminal state.
-  const tripCheck = await prisma.trip.findUnique({ where: { id: tripId } });
-  if (tripCheck && ['SEARCHING', 'OFFERED'].includes(tripCheck.status)) {
-    await prisma.trip.update({
-      where: { id: tripId },
-      data: { status: 'NO_DRIVER_AVAILABLE' },
-    });
-    io.to(`trip:${tripId}`).emit('trip:status', { tripId, status: 'NO_DRIVER_AVAILABLE' });
-  }
+interface DispatcherState {
+  tripId: string;
+  startedAtMs: number;
+  radiusIndex: number;
+  cancelled: boolean;
+  /** Driver id -> number of offers made during this dispatch run. */
+  attempts: Map<string, number>;
+  /** Driver id -> last time this driver was offered (any trip run above). */
+  lastAttemptMs: Map<string, number>;
+  /** Candidate-scan log de-duplication (noisy per-poll logging guard). */
+  lastAttemptScanSig?: string;
+  /** Set when the loop crashed (transient failure) — blocks auto-re-arm so a
+   * persistent DB error cannot spin dispatchers forever. */
+  errored?: boolean;
+  wakeups: Set<() => void>;
 }
 
-const pendingResponses = new Map<string, (accepted: boolean) => void>();
-
-/** Live offers per driver, so accepting one ride invalidates the others
- * instead of leaving the driver with stale, acceptable requests. */
+const dispatchers = new Map<string, DispatcherState>();
+/** Active offers keyed `${tripId}:${driverId}`. */
+const offersByKey = new Map<string, OfferState>();
+/** Driver id -> trip ids with an active offer to that driver. */
 export const offeredTripsByDriver = new Map<string, Set<string>>();
 
-export function trackOffer(driverId: string, tripId: string): void {
-  if (!offeredTripsByDriver.has(driverId)) offeredTripsByDriver.set(driverId, new Set());
-  offeredTripsByDriver.get(driverId)!.add(tripId);
+function offerKey(tripId: string, driverId: string): string {
+  return `${tripId}:${driverId}`;
 }
 
-export function untrackOffer(driverId: string, tripId: string): void {
-  offeredTripsByDriver.get(driverId)?.delete(tripId);
+function offerLog(event: string, fields: Record<string, unknown>): void {
+  console.log(`[DISPATCH] ${event}`, fields);
 }
 
-/** On acceptance, every other pending offer for this driver expires. */
-export function expireOtherOffers(driverId: string, keepTripId: string): void {
-  const set = offeredTripsByDriver.get(driverId);
-  if (!set) return;
-  set.forEach((tripId) => {
-    if (tripId !== keepTripId) {
-      io.to(`driver:${driverId}`).emit('trip:offer_expired', { tripId });
-    }
+function wakeDispatcher(state: DispatcherState): void {
+  for (const wake of state.wakeups) wake();
+}
+
+/** Promise that resolves after `ms` OR as soon as any wake() fires. */
+function waitOrWake(state: DispatcherState, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      timer = null;
+      state.wakeups.delete(wake);
+      resolve();
+    }, ms);
+    const wake = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+        state.wakeups.delete(wake);
+        resolve();
+      }
+    };
+    state.wakeups.add(wake);
   });
-  offeredTripsByDriver.set(driverId, new Set([keepTripId]));
 }
 
-export function handleDriverResponse(tripId: string, driverId: string, accepted: boolean): void {
-  const key = `${tripId}:${driverId}`;
-  const resolve = pendingResponses.get(key);
-  if (resolve) {
-    resolve(accepted);
-    pendingResponses.delete(key);
+function activeOfferCount(tripId: string): number {
+  let n = 0;
+  for (const key of offersByKey.keys()) if (key.startsWith(`${tripId}:`)) n++;
+  return n;
+}
+
+/** Remove one offer (clearing its timer) WITHOUT notifying — notification is
+ * the caller's decision so timeouts and wins emit the right events. */
+function unregisterOffer(tripId: string, driverId: string): OfferState | null {
+  const key = offerKey(tripId, driverId);
+  const offer = offersByKey.get(key);
+  if (!offer) return null;
+  clearTimeout(offer.timer);
+  offersByKey.delete(key);
+  const trips = offeredTripsByDriver.get(driverId);
+  trips?.delete(tripId);
+  if (trips && trips.size === 0) offeredTripsByDriver.delete(driverId);
+  return offer;
+}
+
+/** Expire a single offer: clears state and (unless silent) tells the driver
+ * app its offer is gone. `silent` avoids racing `trip:accepted` on the wire
+ * for the winning driver, whose client clears offers on that event. */
+function expireOffer(tripId: string, driverId: string, reason: string, options?: { silent?: boolean }): void {
+  const offer = unregisterOffer(tripId, driverId);
+  if (!offer) return;
+  if (!options?.silent) {
+    io.to(`driver:${driverId}`).emit('trip:offer_expired', { tripId, offerId: offer.offerId });
+  }
+  offerLog('OFFER_END', {
+    tripId, driverId, offerId: offer.offerId, reason,
+    elapsedMs: Date.now() - (dispatchers.get(tripId)?.startedAtMs ?? offer.createdAtMs),
+  });
+  const state = dispatchers.get(tripId);
+  if (state) wakeDispatcher(state); // freed slot → refill promptly
+}
+
+/** Expire every outstanding offer for a trip. `skipDriver` is the winning
+ * driver on assignment (their client clears via `trip:accepted`). */
+function expireAllTripOffers(tripId: string, reason: string, skipDriver?: string): void {
+  for (const key of [...offersByKey.keys()]) {
+    if (!key.startsWith(`${tripId}:`)) continue;
+    const driverId = key.slice(tripId.length + 1);
+    if (driverId === skipDriver) {
+      unregisterOffer(tripId, driverId);
+      continue;
+    }
+    expireOffer(tripId, driverId, reason);
   }
 }
 
-function waitForDriverResponse(tripId: string, driverId: string, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const key = `${tripId}:${driverId}`;
-    pendingResponses.set(key, resolve);
-    setTimeout(() => {
-      const r = pendingResponses.get(key);
-      if (r) {
-        pendingResponses.delete(key);
-        resolve(false);
+/** On assignment, a driver's offers for OTHER trips must die too — they are
+ * now busy. Waking those dispatchers lets them refill from other drivers. */
+function expireAllDriverOffers(driverId: string, exceptTripId: string, reason: string): void {
+  const trips = offeredTripsByDriver.get(driverId);
+  if (!trips) return;
+  for (const tripId of [...trips]) {
+    if (tripId !== exceptTripId) expireOffer(tripId, driverId, reason);
+  }
+  unregisterOffer(exceptTripId, driverId);
+}
+
+/** Called when a driver transitions stale → fresh (sent a location fix after
+ * exceeding the freshness window). Wakes every active dispatcher so their
+ * next candidate scan re-evaluates this driver immediately. Event-driven:
+ * no dispatcher is created and no unbounded state is tracked per location. */
+export function wakeDriverLocationRefresh(_driverId: string): void {
+  for (const state of dispatchers.values()) {
+    wakeDispatcher(state);
+  }
+}
+
+/** Read-only access to a driver's outstanding offer (for /pending-offers). */
+export function getOfferState(tripId: string, driverId: string): OfferState | null {
+  return offersByKey.get(offerKey(tripId, driverId)) ?? null;
+}
+
+export function ensureDispatch(tripId: string): void {
+  const existing = dispatchers.get(tripId);
+  if (existing) {
+    // Exactly one worker per trip; a second trigger just nudges the existing
+    // loop to re-evaluate (cancel/assign/terminal checks are authoritative).
+    offerLog('ALREADY_RUNNING', { tripId });
+    wakeDispatcher(existing);
+    return;
+  }
+  const state: DispatcherState = {
+    tripId,
+    startedAtMs: Date.now(),
+    radiusIndex: 0,
+    cancelled: false,
+    attempts: new Map(),
+    lastAttemptMs: new Map(),
+    wakeups: new Set(),
+  };
+  dispatchers.set(tripId, state);
+  runDispatcher(state)
+    .catch((err) => console.error('[DISPATCH][ERROR]', { tripId, error: err?.message || err }))
+    .finally(async () => {
+      const exitedCancelled = state.cancelled;
+      const exitedDeadline = Date.now() >= state.startedAtMs + config.driverSearch.searchWindowMs;
+      dispatchers.delete(tripId);
+      // Self-heal the small exit/registration race: if the map entry was
+      // still present when an external trigger bailed out, the nudge went to
+      // a dying loop. If the trip genuinely remains dispatchable (loop ended
+      // early without terminal/assign/cancel), re-arm so the search is never
+      // orphaned. Bounded by the same window conditions as the loop itself.
+      if (!exitedCancelled && !exitedDeadline) {
+        const recheck = await prisma.trip.findUnique({ where: { id: tripId }, select: { status: true } }).catch(() => null);
+        if (recheck && ['SEARCHING', 'OFFERED'].includes(recheck.status)) {
+          offerLog('REARM', { tripId, reason: 'loop_exited_early' });
+          ensureDispatch(tripId);
+        }
       }
-    }, timeoutMs);
+    });
+}
+
+/** Immediately stop a trip's dispatcher and drop its offers. Used when the
+ * passenger cancels (or on restart recovery); the loop exits without
+ * finalizing the trip into NO_DRIVER_AVAILABLE. */
+export function cancelDispatchForTrip(tripId: string, reason: string): void {
+  const state = dispatchers.get(tripId);
+  if (state) {
+    state.cancelled = true;
+    wakeDispatcher(state);
+  }
+  expireAllTripOffers(tripId, `dispatch_cancelled:${reason}`);
+  offerLog('CANCELLED', { tripId, reason });
+}
+
+/** Radius strictly grows with elapsed dispatch time, never resets. */
+function currentRadiusIndex(state: DispatcherState): number {
+  const steps = config.driverSearch.radiusStepsKm;
+  const idx = Math.min(
+    steps.length - 1,
+    Math.floor((Date.now() - state.startedAtMs) / config.driverSearch.radiusExpandMs),
+  );
+  if (idx > state.radiusIndex) state.radiusIndex = idx;
+  return state.radiusIndex;
+}
+
+/**
+ * Candidates from authoritative DB state. Eligibility (all confirmed server-side):
+ * online + accepting + not on a trip + valid finite coordinates + location
+ * fresh enough + reachable (connected socket) + no outstanding offer to this
+ * or any other trip + within the bounded per-driver retry policy.
+ * Ranking: intentional preferred-region feature first, then geodesic distance
+ * to the confirmed pickup point, then fewer prior attempts, then driver id
+ * (deterministic tie-break). No ETA/road-distance estimates exist in this
+ * codebase, so straight-line distance is used and stated as such.
+ */
+async function selectCandidates(
+  trip: { id: string; originLat: number; originLng: number },
+  state: DispatcherState,
+): Promise<Array<{
+  driverId: string; distance: number; preferred: boolean; attempts: number;
+}>> {
+  const rows = await prisma.driverStatus.findMany({
+    where: {
+      isOnline: true,
+      isAccepting: true,
+      isOnTrip: false,
+      latitude: { not: null },
+      longitude: { not: null },
+    },
+    select: {
+      userId: true, latitude: true, longitude: true, updatedAt: true,
+      selectedActive: true, selectedLat: true, selectedLng: true, selectedRadiusKm: true,
+    },
   });
+  // `isOnTrip` is a fast eligibility index, not the source of truth. Exclude
+  // any driver with an authoritative active assignment as well, covering a
+  // brief flag/transaction ordering window.
+  const activeAssignments = await prisma.trip.findMany({
+    where: {
+      driverId: { not: null },
+      status: { in: ['ACCEPTED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS'] },
+    },
+    select: { driverId: true },
+  });
+  const busyDriverIds = new Set(activeAssignments.map((trip) => trip.driverId).filter((id): id is string => Boolean(id)));
+
+  const now = Date.now();
+  const radiusKm = config.driverSearch.radiusStepsKm[currentRadiusIndex(state)];
+  const freshCutoff = now - config.driverSearch.locationFreshnessMs;
+  const graceCutoff = now - config.driverSearch.locationFreshnessMs * config.driverSearch.locationGraceFactor;
+
+  type Candidate = { driverId: string; distance: number; preferred: boolean; attempts: number };
+  const fresh: Candidate[] = [];
+  const staleGrace: Candidate[] = [];
+  for (const row of rows) {
+    if (busyDriverIds.has(row.userId)) continue;
+    const lat = row.latitude!;
+    const lng = row.longitude!;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
+    // Reachability: only promise offers a connected client can actually see.
+    if (!isDriverConnected(row.userId)) continue;
+    // Never re-offer a driver who already holds an offer for this or any trip.
+    if (offeredTripsByDriver.has(row.userId)) continue;
+    const attempts = state.attempts.get(row.userId) ?? 0;
+    if (attempts >= config.driverSearch.maxOffersPerDriver) continue;
+    const last = state.lastAttemptMs.get(row.userId);
+    if (last !== undefined && now - last < config.driverSearch.reofferCooldownMs) continue;
+    const distance = calculateDistance(trip.originLat, trip.originLng, lat, lng);
+    if (distance > radiusKm) continue;
+    const updatedAtMs = row.updatedAt ? new Date(row.updatedAt).getTime() : 0;
+    const preferred = Boolean(
+      row.selectedActive && row.selectedLat !== null && row.selectedLng !== null
+      && calculateDistance(trip.originLat, trip.originLng, row.selectedLat, row.selectedLng) <= row.selectedRadiusKm,
+    );
+    const candidate = { driverId: row.userId, distance, preferred, attempts };
+    if (updatedAtMs >= freshCutoff) fresh.push(candidate);
+    else if (updatedAtMs >= graceCutoff) staleGrace.push(candidate);
+  }
+
+  // Prefer a slightly stale pool (brief network gaps) over an empty one.
+  // The location-age bound only widens here; the search radius never shrinks.
+  const pool = fresh.length > 0 ? fresh : staleGrace;
+  const candidates = pool.sort((a, b) =>
+    Number(b.preferred) - Number(a.preferred)
+    || a.distance - b.distance
+    || a.attempts - b.attempts
+    || a.driverId.localeCompare(b.driverId));
+  // Avoid noisy per-poll logging: only log scans that could spawn offers
+  // (radius change, new candidates, grace-fallback engaged).
+  const scanSig = `${radiusKm}|${candidates.length}|${fresh.length === 0 && staleGrace.length > 0}`;
+  if (state.lastAttemptScanSig !== scanSig) {
+    state.lastAttemptScanSig = scanSig;
+    offerLog('SCAN', {
+      tripId: state.tripId,
+      radiusKm,
+      connected: rows.length,
+      candidates: candidates.length,
+      usedGracePool: fresh.length === 0 && staleGrace.length > 0,
+    });
+  }
+  return candidates;
+}
+
+async function createOffer(
+  trip: { id: string; originLat: number; originLng: number; originAddress: string; destLat: number; destLng: number; destAddress: string; distanceKm: number; durationMin: number; estimatedPrice: number },
+  state: DispatcherState,
+  driverOffer: { driverId: string; distance: number; attempts: number },
+): Promise<void> {
+  const { tripId, driverId } = { tripId: trip.id, driverId: driverOffer.driverId };
+  const key = offerKey(tripId, driverId);
+  if (offersByKey.has(key)) return; // idempotent against wake races
+
+  // Re-check the trip is still dispatchable before pinning OFFERED.
+  await prisma.trip.updateMany({
+    where: { id: tripId, status: 'SEARCHING' },
+    data: { status: 'OFFERED' },
+  });
+  const current = await prisma.trip.findUnique({ where: { id: tripId }, select: { status: true } });
+  if (!current || !['SEARCHING', 'OFFERED'].includes(current.status)) return; // cancelled / assigned meanwhile
+
+  const offerId = randomUUID();
+  const expiresAtMs = Date.now() + config.driverSearch.offerTimeoutMs;
+  const entry: OfferState = {
+    offerId,
+    tripId,
+    driverId,
+    createdAtMs: Date.now(),
+    expiresAtMs,
+    timer: setTimeout(() => {
+      // Fires at most once; dispatchers wake so the freed slot refills fast.
+      expireOffer(tripId, driverId, 'timeout');
+    }, config.driverSearch.offerTimeoutMs),
+  };
+  offersByKey.set(key, entry);
+  if (!offeredTripsByDriver.has(driverId)) offeredTripsByDriver.set(driverId, new Set());
+  offeredTripsByDriver.get(driverId)!.add(tripId);
+  state.attempts.set(driverId, driverOffer.attempts + 1);
+  state.lastAttemptMs.set(driverId, Date.now());
+
+  io.to(`driver:${driverId}`).emit('trip:offer', {
+    tripId,
+    originLat: trip.originLat,
+    originLng: trip.originLng,
+    originAddress: trip.originAddress,
+    destLat: trip.destLat,
+    destLng: trip.destLng,
+    destAddress: trip.destAddress,
+    distanceKm: trip.distanceKm,
+    durationMin: trip.durationMin,
+    estimatedPrice: trip.estimatedPrice,
+    driverDistanceKm: Math.round(driverOffer.distance * 10) / 10,
+    // New, additive fields — existing clients ignore unknown keys.
+    offerId,
+    offerExpiresAt: new Date(expiresAtMs).toISOString(),
+  });
+  offerLog('OFFER', {
+    tripId, driverId, offerId, distanceKm: Math.round(driverOffer.distance * 10) / 10,
+    attempt: driverOffer.attempts + 1,
+    activeOffers: activeOfferCount(tripId),
+    elapsedMs: Date.now() - state.startedAtMs,
+  });
+}
+
+/** Timeout-expiry pruning shared by the loop and timers themselves. */
+async function pruneExpiredOffers(state: DispatcherState): Promise<void> {
+  const now = Date.now();
+  for (const [key, offer] of [...offersByKey.entries()]) {
+    if (!key.startsWith(`${state.tripId}:`)) continue;
+    if (now >= offer.expiresAtMs) {
+      expireOffer(state.tripId, offer.driverId, 'timeout');
+    }
+  }
+}
+
+/** Terminal transition at deadline — strictly conditional so an accepted,
+ * cancelled or completed trip can never be overwritten. */
+async function finalizeNoDriverWindow(state: DispatcherState): Promise<void> {
+  expireAllTripOffers(state.tripId, 'dispatch_deadline');
+  const res = await prisma.trip.updateMany({
+    where: { id: state.tripId, driverId: null, status: { in: ['SEARCHING', 'OFFERED'] } },
+    data: { status: 'NO_DRIVER_AVAILABLE' },
+  });
+  if (res.count === 1) {
+    io.to(`trip:${state.tripId}`).emit('trip:status', { tripId: state.tripId, status: 'NO_DRIVER_AVAILABLE' });
+    offerLog('NO_DRIVER_AVAILABLE', { tripId: state.tripId, elapsedMs: Date.now() - state.startedAtMs });
+  } else {
+    offerLog('FINALIZE_SKIPPED', { tripId: state.tripId, reason: 'trip_left_dispatchable_state' });
+  }
+}
+
+async function runDispatcher(state: DispatcherState): Promise<void> {
+  const tripId = state.tripId;
+  const deadline = state.startedAtMs + config.driverSearch.searchWindowMs;
+  offerLog('START', { tripId, windowMs: config.driverSearch.searchWindowMs, maxParallelOffers: config.driverSearch.maxParallelOffers });
+
+  try {
+    while (!state.cancelled && Date.now() < deadline) {
+      let trip = await prisma.trip.findUnique({ where: { id: tripId } });
+      if (!trip || !['SEARCHING', 'OFFERED'].includes(trip.status)) return;
+
+      await pruneExpiredOffers(state);
+
+      const slots = config.driverSearch.maxParallelOffers - activeOfferCount(tripId);
+      if (slots > 0) {
+        const candidates = await selectCandidates(trip, state);
+        for (const candidate of candidates.slice(0, slots)) {
+          // Each offer re-verifies the trip; stop the moment state moves on.
+          trip = await prisma.trip.findUnique({ where: { id: tripId } });
+          if (!trip || !['SEARCHING', 'OFFERED'].includes(trip.status)) return;
+          if (activeOfferCount(tripId) >= config.driverSearch.maxParallelOffers) break;
+          await createOffer(trip, state, candidate);
+        }
+      }
+
+      const active = activeOfferCount(tripId);
+      if (Date.now() >= deadline) break;
+      if (active === 0) {
+        // No offer outstanding: keep polling for newly eligible drivers.
+        await waitOrWake(state, config.driverSearch.pollIntervalMs);
+      } else {
+        // Wake early whenever any offer resolves (accept/decline/timeout).
+        let nextExpiry = Number.POSITIVE_INFINITY;
+        for (const [key, offer] of offersByKey.entries()) {
+          if (key.startsWith(`${tripId}:`) && offer.expiresAtMs < nextExpiry) {
+            nextExpiry = offer.expiresAtMs;
+          }
+        }
+        const msToExpiry = Math.max(0, nextExpiry - Date.now());
+        await waitOrWake(state, Math.min(msToExpiry + 50, config.driverSearch.pollIntervalMs));
+      }
+    }
+  } finally {
+    if (!state.cancelled && Date.now() >= deadline) {
+      await finalizeNoDriverWindow(state);
+    } else {
+      // Cancelled by assignment / terminal trip / cancel route: drop any
+      // leftovers (win path already removed the winner's offer silently).
+      expireAllTripOffers(tripId, 'dispatcher_stopped');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Offer response arbitration (invoked from the Socket.IO handler, which has
+// already authenticated the driver and enforced role authorization).
+// ---------------------------------------------------------------------------
+
+/**
+ * Handles `trip:respond` for one outstanding offer. Idempotent: duplicate,
+ * delayed or replayed responses after expiry/no-op against a missing offer;
+ * a late acceptance can never revive an expired or terminal trip.
+ * Exactly one concurrent acceptance wins via a conditional DB transition;
+ * losers keep searching and their offers expire — and NOT the winner's
+ * (its client clears state on `trip:accepted`).
+ */
+export async function handleTripResponse(
+  tripId: string,
+  driverId: string,
+  accepted: boolean,
+  responseOfferId?: string,
+): Promise<void> {
+  const key = offerKey(tripId, driverId);
+  const offer = offersByKey.get(key);
+  if (!offer) {
+    offerLog('RESPONSE_IGNORED', { tripId, driverId, reason: 'no_outstanding_offer' });
+    return;
+  }
+  // New clients echo the server-issued identity. Older clients omit it for
+  // compatibility; their response is still constrained by the authenticated
+  // driver + exact outstanding trip offer.
+  if (responseOfferId && responseOfferId !== offer.offerId) {
+    offerLog('RESPONSE_IGNORED', { tripId, driverId, responseOfferId, reason: 'offer_id_mismatch' });
+    return;
+  }
+  if (Date.now() > offer.expiresAtMs) {
+    expireOffer(tripId, driverId, 'late_response_after_expiry');
+    return;
+  }
+
+  if (!accepted) {
+    expireOffer(tripId, driverId, 'declined');
+    return;
+  }
+
+  // Acceptance — atomic claim. The trip claim is guarded on `driverId: null`
+  // plus eligible statuses; the driver claim is guarded on `isOnTrip: false`.
+  // Both run inside one short transaction (no socket I/O inside), so a
+  // concurrent acceptance's affected-row count decides the single winner.
+  try {
+    const outcome = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.trip.updateMany({
+        where: { id: tripId, driverId: null, status: { in: ['SEARCHING', 'OFFERED'] } },
+        data: { driverId, status: 'ACCEPTED', acceptedAt: new Date() },
+      });
+      if (claimed.count !== 1) return 'lost_trip_race';
+      const driverClaim = await tx.driverStatus.updateMany({
+        where: { userId: driverId, isOnTrip: false },
+        data: { isOnTrip: true },
+      });
+      if (driverClaim.count !== 1) {
+        // Driver became busy elsewhere between offer and response: roll the
+        // trip claim back inside the same transaction.
+        const reverted = await tx.trip.updateMany({
+          where: { id: tripId, driverId, status: 'ACCEPTED' },
+          data: { driverId: null, status: 'OFFERED' },
+        });
+        if (reverted.count !== 1) return 'trip_moved_though'; // cancelled meanwhile — leave as-is
+        return 'driver_busy';
+      }
+      return 'assigned';
+    });
+    if (outcome !== 'assigned') {
+      expireOffer(tripId, driverId, outcome === 'driver_busy' ? 'driver_became_busy' : 'lost_assignment_race');
+      return;
+    }
+  } catch (err) {
+    // Transient DB failure: do NOT declare no-driver; leave the offer valid
+    // to expire naturally and let the dispatcher re-drive.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[DISPATCH][ASSIGN_DB_ERROR]', { tripId, driverId, error: message });
+    return;
+  }
+
+  // ---- Winner path ----
+  const state = dispatchers.get(tripId);
+  if (state) {
+    state.cancelled = true;
+    wakeDispatcher(state);
+  }
+  offerLog('ASSIGNED', {
+    tripId, driverId, offerId: offer.offerId,
+    elapsedMs: Date.now() - (state?.startedAtMs ?? offer.createdAtMs),
+  });
+
+  // Winner's own offer disappears silently (their trip:accepted arrives).
+  unregisterOffer(tripId, driverId);
+  // Everyone else's offers for this trip end; they must not stay occupied.
+  expireAllTripOffers(tripId, 'assigned_elsewhere', driverId);
+  // A busy driver's offers for other trips end too; those dispatchers refill.
+  expireAllDriverOffers(driverId, tripId, 'driver_assigned_elsewhere');
+
+  io.to(`trip:${tripId}`).emit('trip:accepted', { tripId, driverId, status: 'ACCEPTED' });
+  io.to(`driver:${driverId}`).emit('trip:accepted', { tripId, status: 'ACCEPTED' });
 }
 
 // Cancel trip
@@ -542,6 +865,12 @@ router.put('/:id/cancel', authMiddleware, async (req: Request, res: Response) =>
       where: { userId: trip.driverId },
       data: { isOnTrip: false },
     });
+  }
+
+  // Stop the dispatcher and invalidate every outstanding offer atomically
+  // with the cancellation, so no stale worker keeps emitting offers.
+  if (['SEARCHING', 'OFFERED', 'NO_DRIVER_AVAILABLE'].includes(trip.status)) {
+    cancelDispatchForTrip(tripId, 'passenger_cancelled');
   }
 
   io.to(`trip:${trip.id}`).emit('trip:cancelled', { tripId: trip.id, status: 'CANCELLED' });
@@ -727,15 +1056,22 @@ router.put('/:id/retry-dispatch', authMiddleware, requireRole('PASSENGER'), asyn
       return;
     }
 
-    const updated = await prisma.trip.update({
-      where: { id: trip.id },
+    const updated = await prisma.trip.updateMany({
+      where: { id: trip.id, status: 'NO_DRIVER_AVAILABLE' },
       data: { status: 'SEARCHING' },
     });
+    if (updated.count !== 1) {
+      // Concurrent re-arm already ran; report the reloaded trip.
+      const current = await prisma.trip.findUnique({ where: { id: trip.id } });
+      res.json({ success: true, data: current });
+      return;
+    }
     io.to(`trip:${trip.id}`).emit('trip:status', { tripId: trip.id, status: 'SEARCHING' });
 
     ensureDispatch(trip.id);
+    const updatedOne = await prisma.trip.findUnique({ where: { id: trip.id } });
 
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: updatedOne });
   } catch {
     res.status(500).json({ success: false, error: 'Internal error' });
   }
@@ -890,12 +1226,56 @@ export async function reconcileDriverStates(): Promise<void> {
         },
       });
       if (!activeTrip) {
-        await prisma.driverStatus.update({
-          where: { userId: d.userId },
+        // Conditional update: an acceptance may have committed between our
+        // read and this write; only clear when there is really no live
+        // assigned trip (relation `driverId = driver` is implied).
+        const cleared = await prisma.driverStatus.updateMany({
+          where: {
+            userId: d.userId,
+            isOnTrip: true,
+            NOT: {
+              user: {
+                assignedTrips: {
+                  some: { status: { in: ['ACCEPTED', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS'] } },
+                },
+              },
+            },
+          },
           data: { isOnTrip: false },
         });
-        console.log(`[Reconcile] Fixed stale isOnTrip for driver ${d.userId}`);
+        if (cleared.count === 1) {
+          console.log(`[Reconcile] Fixed stale isOnTrip for driver ${d.userId}`);
+        }
       }
+    }
+
+    // Restart recovery: outstanding offers are in-memory only and died with
+    // the previous process. Re-arm dispatch on every still-dispatchable trip
+    // so passengers are not left stuck in SEARCHING/OFFERED limbo. `OFFERED`
+    // offers can no longer be answered (no in-memory identity) — revert them
+    // to SEARCHING under an exact-status guard so a real acceptance in flight
+    // is never clobbered.
+    const orphanSearch = await prisma.trip.findMany({
+      where: { status: 'SEARCHING', createdAt: { gte: new Date(Date.now() - 30 * 60_000) } },
+      select: { id: true },
+      take: 100,
+    });
+    const orphanOffered = await prisma.trip.findMany({
+      where: { status: 'OFFERED', createdAt: { gte: new Date(Date.now() - 30 * 60_000) } },
+      select: { id: true },
+      take: 100,
+    });
+    for (const trip of orphanOffered) {
+      const reverted = await prisma.trip.updateMany({
+        where: { id: trip.id, driverId: null, status: 'OFFERED' },
+        data: { status: 'SEARCHING' },
+      });
+      if (reverted.count === 1) {
+        console.log('[DISPATCH][RESTART_RECOVERY] offer lost to restart, re-searching', { tripId: trip.id });
+      }
+    }
+    for (const trip of [...orphanSearch, ...orphanOffered]) {
+      ensureDispatch(trip.id);
     }
   } catch (err) {
     console.error('[Reconcile] Error reconciling driver states:', err);

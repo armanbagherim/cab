@@ -3,32 +3,26 @@ import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View, Text, TextInput, StyleSheet, Pressable, ActivityIndicator,
-  KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { api } from '../services/api';
 import { useAuth } from '../context/AuthContext';
-import { ArrowRightIcon } from '../components/Icons';
+import BackButton from '../components/BackButton';
+import OtpInput from '../components/OtpInput';
 import ConfirmDialog from '../components/ConfirmDialog';
+import { useKeyboardBottomInset } from '../hooks/useKeyboardBottomInset';
 import { COLORS, FONTS, SPACING, RADIUS } from '../utils/theme';
 
-/** Persian (۰-۹) and Arabic-Indic (٠-٩) digits → ASCII equivalents, so
- * verification codes typed with any keyboard layout are treated identically. */
-function normalizeDigits(raw: string): string {
-  const fa = '۰۱۲۳۴۵۶۷۸۹';
-  const ar = '٠١٢٣٤٥٦٧٨٩';
-  return raw.replace(/[۰-۹٠-٩]/g, (ch) => {
-    const i = fa.indexOf(ch);
-    return i >= 0 ? String(i) : String(ar.indexOf(ch));
-  });
-}
+const LENGTH = 6; // must match OtpInput's cell count
 
 export default function VerifyOtpScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const keyboardInset = useKeyboardBottomInset();
   const { phone, role } = useLocalSearchParams<{ phone: string; role: string }>();
   const { login } = useAuth();
 
   const [otp, setOtp] = useState('');
+  const [otpError, setOtpError] = useState(false);
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [step, setStep] = useState<'otp' | 'name'>('otp');
@@ -36,7 +30,7 @@ export default function VerifyOtpScreen() {
   const [dialogError, setDialogError] = useState<string | null>(null);
   const isDriver = role === 'DRIVER';
 
-  const otpReady = otp.length === 6;
+  const otpReady = otp.length === LENGTH;
   const nameReady = useMemo(
     () => firstName.trim().length >= 2 && lastName.trim().length >= 2,
     [firstName, lastName]
@@ -51,7 +45,7 @@ export default function VerifyOtpScreen() {
   }
 
   async function handleVerify() {
-    if (otp.length !== 6) return;
+    if (otp.length !== LENGTH) return;
     setLoading(true);
     try {
       await completeLogin(otp);
@@ -60,6 +54,8 @@ export default function VerifyOtpScreen() {
       if (msg.includes('نام') || msg.includes('ثبت')) {
         setStep('name');
       } else {
+        // Wrong/failed code: highlight the cells; typing again clears it.
+        setOtpError(true);
         setDialogError(msg);
       }
     } finally {
@@ -82,37 +78,24 @@ export default function VerifyOtpScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.headerRow}>
-        <Pressable
-          accessibilityLabel="بازگشت"
-          onPress={() => router.back()}
-          style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.7 }]}
-          hitSlop={8}
-        >
-          <ArrowRightIcon size={18} />
-        </Pressable>
+        <BackButton onPress={() => router.back()} />
         <Text style={styles.headerTitle}>{step === 'otp' ? 'کد تأیید' : isDriver ? 'ثبت‌نام سفیر' : 'ثبت‌نام مسافر'}</Text>
       </View>
 
-      <KeyboardAvoidingView
-        style={styles.body}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
+      <View style={[styles.body, { paddingBottom: styles.body.paddingBottom + keyboardInset }]}>
         {step === 'otp' ? (
           <>
             <Text style={styles.subTitle}>کد ۶ رقمی ارسال‌شده به شماره زیر را وارد کنید</Text>
             <Text style={styles.phoneBadge}>{phone}</Text>
 
-            <TextInput
-              style={styles.codeInput}
+            <OtpInput
               value={otp}
-              onChangeText={(t) => setOtp(normalizeDigits(t).replace(/[^0-9]/g, '').slice(0, 6))}
-              placeholder="------"
-              placeholderTextColor={COLORS.textTertiary}
-              keyboardType="number-pad"
-              inputMode="numeric"
-              maxLength={6}
-              textAlign="center"
-              autoFocus
+              onChange={(v) => {
+                setOtp(v);
+                if (otpError) setOtpError(false); // clear the error as the user corrects the code
+              }}
+              onComplete={(v) => { if (!loading) handleVerify(); }}
+              error={otpError}
             />
 
             <Pressable
@@ -172,7 +155,7 @@ export default function VerifyOtpScreen() {
             </Pressable>
           </>
         )}
-      </KeyboardAvoidingView>
+      </View>
 
       <ConfirmDialog
         visible={!!dialogError}
@@ -192,14 +175,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row-reverse', alignItems: 'center',
     gap: SPACING.md, padding: SPACING.lg,
   },
-  backBtn: {
-    width: 40, height: 40, borderRadius: RADIUS.sm,
-    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border,
-    justifyContent: 'center', alignItems: 'center',
-  },
   headerTitle: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text },
 
-  body: { flex: 1, paddingHorizontal: SPACING.xxl },
+  body: { flex: 1, paddingHorizontal: SPACING.xxl, paddingBottom: SPACING.lg },
   subTitle: {
     fontFamily: FONTS.regular, fontSize: 14, color: COLORS.textSecondary,
     textAlign: 'right', marginTop: SPACING.xl, lineHeight: 22,
@@ -211,14 +189,6 @@ const styles = StyleSheet.create({
     alignSelf: 'center', borderRadius: RADIUS.full,
     overflow: 'hidden', paddingVertical: 6, paddingHorizontal: SPACING.lg,
     writingDirection: 'ltr' as any,
-  },
-
-  codeInput: {
-    backgroundColor: COLORS.surface, borderRadius: RADIUS.lg,
-    paddingVertical: SPACING.lg, marginTop: SPACING.xxl,
-    fontSize: 30, fontFamily: FONTS.bold, color: COLORS.text,
-    borderWidth: 1.2, borderColor: COLORS.border,
-    textAlign: 'center',
   },
 
   fieldGroup: { marginTop: SPACING.xl },

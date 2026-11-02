@@ -7,7 +7,8 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import { CabMap, NeshanMapRef } from '../../components/CabMap';
-import { LocateIcon, LocateOffIcon, SearchIcon, LogoutIcon, CloseIcon, ClockIcon, RoadIcon, HistoryIcon, PersonIcon } from '../../components/Icons';
+import { LocateIcon, LocateOffIcon, SearchIcon, LogoutIcon, CloseIcon, ClockIcon, RoadIcon, HistoryIcon, PersonIcon, MenuIcon } from '../../components/Icons';
+import PopoverMenu from '../../components/PopoverMenu';
 import { api } from '../../services/api';
 import { socketService } from '../../services/socket';
 import { useAuth } from '../../context/AuthContext';
@@ -37,7 +38,7 @@ let estimateCache: Record<string, CachedEstimate> = {};
 export default function PassengerHomeScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { logout, token } = useAuth();
+  const { logout, token, user, isLoading } = useAuth();
   const mapRef = useRef<NeshanMapRef>(null);
 
   // ---- Selection state -------------------------------------------------------
@@ -60,6 +61,7 @@ export default function PassengerHomeScreen() {
   const [searching, setSearching] = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeq = useRef(0); // stale-response guard for the search API
+  const cameraCommandSeq = useRef(0); // latest search/GPS action wins
 
   // ---- Fare / submission -----------------------------------------------------
   const [estimate, setEstimate] = useState<CachedEstimate | null>(null);
@@ -70,6 +72,7 @@ export default function PassengerHomeScreen() {
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [nearbyDrivers, setNearbyDrivers] = useState<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number }>>([]);
   const [tripError, setTripError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const panelH = useRef(0);
 
   // ---- Reverse geocoding: single cached lookup per CONFIRMED point -------------
@@ -99,6 +102,7 @@ export default function PassengerHomeScreen() {
   // ---- Locate me: explicit request, loading state, no auto-confirm ------------
   const runLocate = useCallback(async () => {
     if (locating.current) return; // no duplicate requests
+    const commandSeq = ++cameraCommandSeq.current;
     locating.current = true;
     setLocatePhase('acquiring');
     try {
@@ -125,6 +129,11 @@ export default function PassengerHomeScreen() {
       }
       const lat = loc.coords.latitude;
       const lng = loc.coords.longitude;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        setLocatePhase('error');
+        return;
+      }
+      if (commandSeq !== cameraCommandSeq.current) return;
       mapRef.current?.animateTo(lat, lng, 15.5);
       centerRef.current = { lat, lng, addr: '' };
       setLocatePhase('idle');
@@ -235,7 +244,10 @@ export default function PassengerHomeScreen() {
   const handleSearchSelect = useCallback((item: any) => {
     const lat = item.location?.y ?? item.location?.latitude;
     const lng = item.location?.x ?? item.location?.longitude;
-    if (typeof lat === 'number' && typeof lng === 'number') {
+    if (typeof lat === 'number' && typeof lng === 'number'
+      && Number.isFinite(lat) && Number.isFinite(lng)
+      && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+      cameraCommandSeq.current += 1;
       mapRef.current?.animateTo(lat, lng, 16.5);
       centerRef.current = { lat, lng, addr: '' };
       // Seed the address cache with the provider's own data — no geocode call needed.
@@ -398,6 +410,13 @@ export default function PassengerHomeScreen() {
     }
   }, [logout]);
 
+  // Logout safety net: AuthContext owns cleanup, and replace('/') lands on
+  // the Super App home. Enforce the destination here too so a failure in the
+  // global navigation never leaves the app stuck inside the cab section.
+  useEffect(() => {
+    if (!isLoading && !user) router.replace('/home' as any);
+  }, [user, isLoading, router]);
+
   // ---- Derived, remount-safe map data ------------------------------------------
   const markers = useMemo(() => {
     const m: Array<{ id: string; latitude: number; longitude: number; color?: string; label?: string; glyph?: 'dot' | 'car' }> = nearbyDrivers.map((driver) => ({
@@ -471,27 +490,16 @@ export default function PassengerHomeScreen() {
               جست‌وجوی آدرس یا انتخاب روی نقشه
             </Text>
           </Pressable>
+          {/* Single menu button — Trips / Profile / Logout live in a popover
+              instead of a row of buttons beside the search pill. */}
           <View style={[s.headerActions, { top: insets.top + 10 }]}>
             <Pressable
-              accessibilityLabel="سفرهای من"
-              onPress={() => router.push('/(passenger)/trip-history')}
+              accessibilityLabel="منو"
+              accessibilityRole="button"
+              onPress={() => setMenuOpen(true)}
               style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
             >
-              <HistoryIcon size={20} color={COLORS.textSecondary} />
-            </Pressable>
-            <Pressable
-              accessibilityLabel="پروفایل"
-              onPress={() => router.push('/profile')}
-              style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
-            >
-              <PersonIcon size={20} color={COLORS.textSecondary} />
-            </Pressable>
-            <Pressable
-              accessibilityLabel="خروج از حساب"
-              onPress={handleLogout}
-              style={({ pressed }) => [s.headerBtn, pressed && { opacity: 0.85 }]}
-            >
-              <LogoutIcon size={20} color={COLORS.error} />
+              <MenuIcon size={22} color={COLORS.textSecondary} />
             </Pressable>
           </View>
         </>
@@ -512,7 +520,7 @@ export default function PassengerHomeScreen() {
               onChangeText={setSearchQ}
               placeholder="جست‌وجوی آدرس در تهران..."
               placeholderTextColor={COLORS.textTertiary}
-              textAlign="right"
+               textAlign="right"
               autoFocus
               returnKeyType="search"
             />
@@ -549,6 +557,37 @@ export default function PassengerHomeScreen() {
           )}
         </KeyboardAvoidingView>
       ))}
+
+      {/* ---------------- Popover menu (Trips / Profile / Logout) ---------------- */}
+      <PopoverMenu
+        visible={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        // headerActions is pinned to the physical right edge — same side here,
+        // and screen-edge clipping is impossible (Modal layer).
+        side="right"
+        top={insets.top + 62}
+        items={[
+          {
+            key: 'trips',
+            label: 'سفرهای من',
+            icon: <HistoryIcon size={20} color={COLORS.textSecondary} />,
+            onPress: () => router.push('/(passenger)/trip-history'),
+          },
+          {
+            key: 'profile',
+            label: 'پروفایل',
+            icon: <PersonIcon size={20} color={COLORS.textSecondary} />,
+            onPress: () => router.push('/profile'),
+          },
+          {
+            key: 'logout',
+            label: 'خروج از حساب',
+            icon: <LogoutIcon size={20} color={COLORS.error} />,
+            danger: true,
+            onPress: handleLogout,
+          },
+        ]}
+      />
 
       {/* ---------------- Locate-me FAB ---------------- */}
       {stage !== 'result' ? <Pressable
@@ -717,7 +756,7 @@ const s = StyleSheet.create({
   locateRetryText: { fontFamily: FONTS.medium, fontSize: 12, color: '#fff' },
 
   searchPill: {
-    position: 'absolute', left: SPACING.lg, right: 164,
+    position: 'absolute', left: SPACING.lg, right: 76, // room for the single menu button (44 + gaps)
     flexDirection: 'row-reverse', alignItems: 'center', gap: 10,
     backgroundColor: '#FFFFFF', borderRadius: RADIUS.full,
     paddingVertical: 13, paddingHorizontal: 16,
@@ -751,7 +790,7 @@ const s = StyleSheet.create({
     ...SHADOW.md,
   },
   searchClose: { width: 36, height: 36, justifyContent: 'center', alignItems: 'center' },
-  searchInput: { flex: 1, fontFamily: FONTS.regular, fontSize: 14, color: COLORS.text, paddingVertical: 8, textAlign: 'right', outlineStyle: 'none' as any },
+  searchInput: { flex: 1, fontFamily: FONTS.regular, fontSize: 14, color: COLORS.text, paddingVertical: 8, textAlign: 'right', writingDirection: 'rtl' as any, outlineStyle: 'none' as any },
   searchMeta: { alignItems: 'center', paddingTop: 4 },
   searchMetaCard: {
     width: '100%', backgroundColor: COLORS.surface, borderRadius: RADIUS.lg,
@@ -827,8 +866,8 @@ const s = StyleSheet.create({
   itinRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
   pointDot: { width: 10, height: 10, borderRadius: 5 },
   itinContent: { flex: 1, alignItems: 'flex-end' },
-  itinLabel: { fontFamily: FONTS.regular, fontSize: 11, color: COLORS.textTertiary },
-  itinText: { fontFamily: FONTS.semibold, fontSize: 13, color: COLORS.text, marginTop: 1, textAlign: 'right' },
+  itinLabel: { fontFamily: FONTS.regular, fontSize: 11, color: COLORS.textTertiary, textAlign: 'right', writingDirection: 'rtl' as any },
+  itinText: { fontFamily: FONTS.semibold, fontSize: 13, color: COLORS.text, marginTop: 1, textAlign: 'right', writingDirection: 'rtl' as any },
   connectorLine: { width: 2, height: 16, backgroundColor: '#CBD5E1', marginRight: 4, marginVertical: 3 },
   editChipWrap: {
     backgroundColor: 'rgba(15, 169, 88, 0.1)', borderRadius: RADIUS.full,

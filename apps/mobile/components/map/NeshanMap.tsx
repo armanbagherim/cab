@@ -121,9 +121,13 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
         var marker = markerRefs[m.id];
         if (!marker) {
           var vehicle = m.glyph === 'car';
-          marker = L.marker([m.latitude, m.longitude], {
-            icon: L.divIcon({ className: vehicle ? 'vehicle-marker-icon' : '', html: pinHtml(m.color || '#111111', m.label, m.glyph, m.heading || 0), iconSize: vehicle ? [34, 34] : [40, 48], iconAnchor: vehicle ? [17, 17] : [20, 44] })
-          }).addTo(pinLayer);
+           marker = L.marker([m.latitude, m.longitude], {
+             // Keep endpoint/driver markers above every route overlay on iOS
+             // WebView as well as browser Leaflet.
+             pane: 'markerPane',
+             zIndexOffset: 1000,
+             icon: L.divIcon({ className: vehicle ? 'vehicle-marker-icon' : '', html: pinHtml(m.color || '#111111', m.label, m.glyph, m.heading || 0), iconSize: vehicle ? [34, 34] : [40, 48], iconAnchor: vehicle ? [17, 17] : [20, 44] })
+           }).addTo(pinLayer);
           markerRefs[m.id] = marker;
         } else {
           marker.setLatLng([m.latitude, m.longitude]);
@@ -135,6 +139,9 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
       });
       Object.keys(markerRefs).forEach(function (id) {
         if (!incoming[id]) { pinLayer.removeLayer(markerRefs[id]); delete markerRefs[id]; }
+      });
+      Object.keys(markerRefs).forEach(function (id) {
+        if (markerRefs[id].bringToFront) markerRefs[id].bringToFront();
       });
     }
 
@@ -156,18 +163,24 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
       var w = line.width || 4;
        var base = line.color || '#111111';
 
-      // 1) soft outer halo   2) depth shadow underlay   3) crisp foreground
-      addPoly(cs, { color: '#0B1512', weight: w + 8, opacity: 0.07, lineCap: 'round', lineJoin: 'round' });
-      addPoly(cs, { color: '#0B1512', weight: w + 3, opacity: 0.16, lineCap: 'round', lineJoin: 'round' });
+       // Native Leaflet/WebView rasterization can turn stacked wide strokes
+       // into a muddy filled-looking shape. Keep one narrow underlay and one
+       // crisp foreground stroke; both are true stroked paths.
+       addPoly(cs, { color: '#0B1512', weight: w + 2, opacity: 0.16, lineCap: 'round', lineJoin: 'round' });
 
-      if (line.to) {
-        gradientSegments(line.coordinates, base, line.to).forEach(function (seg) {
-          addPoly(seg.coordinates.map(function (c) { return [c.latitude, c.longitude]; }),
-            { color: seg.color, weight: w, opacity: 0.98, lineCap: 'round', lineJoin: 'round' });
-        });
-      } else {
-        addPoly(cs, { color: base, weight: w, opacity: 0.98, lineCap: 'round', lineJoin: 'round' });
-      }
+       // Keep native rendering deterministic. The browser renderer can use
+       // segmented gradient strokes, but injecting that helper into a
+       // WebView is not reliable on iOS and can leave only the underlay
+       // visible. A single native stroke is supported consistently and uses
+       // the destination accent when available, matching the intended red
+       // route appearance without changing the real road geometry.
+       addPoly(cs, {
+         color: line.to || base,
+         weight: w,
+         opacity: 0.98,
+         lineCap: 'round',
+         lineJoin: 'round',
+       });
 
       // Route stays underneath pins and labels.
       pinLayer.eachLayer(function (l) { if (l.bringToFront) l.bringToFront(); });
@@ -182,7 +195,7 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
       post({ type: 'click', lat: e.latlng.lat, lng: e.latlng.lng });
     });
 
-    window.addEventListener('message', function (e) {
+    function handleNativeMessage(e) {
       var d; try { d = JSON.parse(e.data); } catch (err) { return; }
       if (!d || !d.type) return;
       if (d.type === 'animate') {
@@ -202,7 +215,12 @@ const mapHtml = (initialLat: number, initialLng: number, initialZoom: number) =>
           map.flyToBounds(L.latLngBounds(cs), { paddingTopLeft: [d.padding || 60, d.padding || 60], paddingBottomRight: [d.padding || 60, d.padding || 60] });
         }
       }
-    });
+    }
+    // Android WebView delivers RN messages on document; iOS historically
+    // delivered them on window. Listen on both without changing the map
+    // protocol, so imperative camera commands work on both platforms.
+    window.addEventListener('message', handleNativeMessage);
+    document.addEventListener('message', handleNativeMessage);
 
     map.whenReady(function () {
       isReady = true;

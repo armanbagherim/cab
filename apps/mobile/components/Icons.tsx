@@ -12,6 +12,10 @@ export const LogoutIcon = ({ size = 20, color = COLORS.error, style }: Props) =>
   <MaterialCommunityIcons name="logout" size={size} color={color} style={style} />
 );
 
+export const MenuIcon = ({ size = 22, color = COLORS.textSecondary, style }: Props) => (
+  <MaterialCommunityIcons name="dots-vertical" size={size} color={color} style={style} />
+);
+
 export const ArrowRightIcon = ({ size = 22, color = COLORS.text, style }: Props) => (
   <MaterialIcons name="arrow-forward-ios" size={size} color={color} style={style} />
 );

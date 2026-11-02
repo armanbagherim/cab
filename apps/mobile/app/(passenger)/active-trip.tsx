@@ -9,7 +9,9 @@ import { socketService } from '../../services/socket';
 import { initNotifications, notifyEvent } from '../../services/notifications';
 import { useAuth } from '../../context/AuthContext';
 import { CabMap, NeshanMapRef } from '../../components/CabMap';
-import { PersonIcon, PhoneIcon, ArrowRightIcon, AlertIcon } from '../../components/Icons';
+import { PersonIcon, AlertIcon } from '../../components/Icons';
+import BackButton from '../../components/BackButton';
+import CallButton from '../../components/CallButton';
 import ConfirmDialog from '../../components/ConfirmDialog';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../../utils/theme';
 import { decodePolyline } from '../../utils/geo';
@@ -70,7 +72,11 @@ export default function ActiveTripScreen() {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => () => { if (verifyTimer.current) clearTimeout(verifyTimer.current); }, []);
   useEffect(() => {
-    initNotifications().catch(() => {});
+    initNotifications()
+      .then((limitations) => {
+        if (limitations.length) console.warn('[Passenger][NOTIFICATIONS_LIMITED]', limitations);
+      })
+      .catch((error) => console.warn('[Passenger][NOTIFICATIONS_INIT_ERROR]', error));
   }, []);
 
   // Fit both confirmed points once per trip (never on every state change, so
@@ -311,9 +317,7 @@ export default function ActiveTripScreen() {
       </View>
 
       <View style={[s.header, { top: insets.top + 10 }]}>
-        <Pressable style={s.headerBtn} onPress={() => router.back()} accessibilityLabel="بازگشت">
-          <ArrowRightIcon size={18} />
-        </Pressable>
+        <BackButton onPress={() => router.back()} />
         <Text style={s.headerTitle}>{ended ? 'نتیجه سفر' : 'سفر فعال'}</Text>
         <View style={{ width: 40 }} />
       </View>
@@ -326,17 +330,17 @@ export default function ActiveTripScreen() {
           </View>
         </View>
 
-        {/* Driver info appears only once the backend actually assigned one. */}
+        {/* Driver info appears only once the backend actually assigned one.
+            The raw phone number is no longer displayed under the name; the
+            Call button opens the dialer with the real number and hides
+            entirely when the trip has no phone. */}
         {trip.driver ? (
           <View style={s.driverCard}>
             <PersonIcon size={40} color={COLORS.brand} />
             <View style={s.driverTextWrap}>
               <Text style={s.driverName}>{trip.driver.firstName} {trip.driver.lastName}</Text>
-              <View style={s.driverPhoneRow}>
-                <PhoneIcon size={13} color={COLORS.textSecondary} />
-                <Text style={s.driverPhone}>{trip.driver.phone}</Text>
-              </View>
             </View>
+            <CallButton phone={trip.driver?.phone} variant="circle" />
           </View>
         ) : meta.tone === 'searching' ? (
           <Text style={s.driverPending}>به‌محض پذیرش سفیر، اطلاعات او اینجا نمایش داده می‌شود.</Text>
@@ -443,8 +447,6 @@ const s = StyleSheet.create({
   },
   driverTextWrap: { flex: 1 },
   driverName: { fontFamily: FONTS.bold, fontSize: 15, color: COLORS.text, textAlign: 'right' },
-  driverPhoneRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 5, marginTop: 2 },
-  driverPhone: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary, writingDirection: 'ltr' as any },
   driverPending: {
     fontFamily: FONTS.regular, fontSize: 12, color: COLORS.textTertiary,
     textAlign: 'center', marginBottom: SPACING.md,
@@ -452,8 +454,8 @@ const s = StyleSheet.create({
 
   infoCard: { marginBottom: SPACING.md },
   infoRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 5 },
-  infoLabel: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary },
-  infoValue: { flex: 1, fontFamily: FONTS.medium, fontSize: 13, color: COLORS.text, textAlign: 'left', marginLeft: SPACING.md },
+  infoLabel: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary, textAlign: 'right', writingDirection: 'rtl' as any },
+  infoValue: { flex: 1, fontFamily: FONTS.medium, fontSize: 13, color: COLORS.text, textAlign: 'right', writingDirection: 'rtl' as any, marginLeft: SPACING.md },
   infoValueAccent: { fontFamily: FONTS.bold, color: COLORS.brand, fontSize: 15 },
   infoDivider: { height: 1, backgroundColor: COLORS.divider, marginVertical: 6 },
 

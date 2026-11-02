@@ -266,10 +266,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center', alignItems: 'center', zIndex: 100,
   },
   // Mirrors the native center pin geometry (teardrop anchored at center).
+  // rotate(+45deg) puts the sharp (low-radius) corner at the BOTTOM so the
+  // pin's tip points DOWN. rotate(-45deg) was a web-only regression that
+  // made the tip point right; native was always correct and is untouched.
   pinBody: {
     width: 30, height: 30, borderRadius: 15,
     borderBottomRightRadius: 2,
-    transform: [{ rotate: '-45deg' }],
+    transform: [{ rotate: '45deg' }],
     borderWidth: 2.5, borderColor: '#FFFFFF',
     alignItems: 'center', justifyContent: 'center',
     marginBottom: 16,
@@ -281,7 +284,8 @@ const styles = StyleSheet.create({
   },
   pinGlyph: {
     width: 10, height: 10, borderRadius: 5, backgroundColor: '#FFFFFF',
-    transform: [{ rotate: '45deg' }],
+    // Counter-rotates the glyph so the dot stays upright inside the teardrop.
+    transform: [{ rotate: '-45deg' }],
   },
   pinHalo: {
     position: 'absolute', bottom: '50%', marginBottom: -3,

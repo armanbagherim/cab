@@ -1,14 +1,14 @@
 import React, { useMemo, useState } from 'react';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
-  View, Text, TextInput, StyleSheet, Pressable, ActivityIndicator,
-  KeyboardAvoidingView, Platform, Image,
+  View, Text, TextInput, StyleSheet, Pressable, ActivityIndicator, Image,
 } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { useRouter } from 'expo-router';
-import { ArrowRightIcon } from '../components/Icons';
+import BackButton from '../components/BackButton';
 import { api } from '../services/api';
 import ConfirmDialog from '../components/ConfirmDialog';
+import { useKeyboardBottomInset } from '../hooks/useKeyboardBottomInset';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW } from '../utils/theme';
 
 /** Persian (۰-۹) and Arabic-Indic (٠-٩) digits → ASCII equivalents. */
@@ -35,6 +35,7 @@ export default function LoginScreen() {
   const router = useRouter();
   const { role } = useLocalSearchParams<{ role?: string }>();
   const insets = useSafeAreaInsets();
+  const keyboardInset = useKeyboardBottomInset();
   const isDriver = role === 'DRIVER';
 
   const [phone, setPhone] = useState('');
@@ -80,23 +81,21 @@ export default function LoginScreen() {
             <Text style={styles.brandLetter}>س</Text>
           </View>
         </View>
-        {/* Back to role selection */}
-        <Pressable
-          accessibilityLabel="بازگشت"
-          onPress={() => router.back()}
-          style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.7 }, { top: insets.top + 10 }]}
-          hitSlop={12}
-        >
-          <ArrowRightIcon size={18} color="#fff" />
-        </Pressable>
+        {/* Back to role selection — shared back button, arrow points left */}
+        <View style={[styles.backBtnWrap, { top: insets.top + 10 }]}>
+          <BackButton light onPress={() => router.back()} />
+        </View>
       </View>
 
-      {/* Sheet */}
-      <KeyboardAvoidingView
-        style={styles.sheetWrap}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
-        <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom + SPACING.lg, 28) }]}>
+      {/* Sheet — bottom padding lifts the Continue button above the keyboard
+          on both native and iOS Safari/WebView (VisualViewport-based hook). */}
+      <View style={styles.sheetWrap}>
+        <View
+          style={[
+            styles.sheet,
+            { paddingBottom: Math.max(insets.bottom + SPACING.lg, 28) + keyboardInset },
+          ]}
+        >
           <View style={styles.sheetGrabber} />
 
           <Text style={styles.greeting}>
@@ -107,8 +106,10 @@ export default function LoginScreen() {
           </Text>
 
           <View style={styles.inputWrap}>
+            {/* Iran (+۹۸) is the only supported country for now, so the code
+                is fixed and not shown as a redundant disabled field. The input
+                is purely the Iranian mobile number (09xxxxxxxxx). */}
             <View style={[styles.inputGroup, error && styles.inputGroupError]}>
-              <Text style={styles.inputPrefix}>+۹۸</Text>
               <TextInput
                 style={styles.input}
                 value={phone}
@@ -148,7 +149,7 @@ export default function LoginScreen() {
             )}
           </Pressable>
         </View>
-      </KeyboardAvoidingView>
+      </View>
     </View>
   );
 }
@@ -168,11 +169,8 @@ const styles = StyleSheet.create({
   },
   brandLetter: { fontFamily: FONTS.bold, fontSize: 34, color: '#fff', marginTop: -3 },
 
-  backBtn: {
+  backBtnWrap: {
     position: 'absolute', left: SPACING.lg,
-    width: 40, height: 40, borderRadius: 20,
-    backgroundColor: 'rgba(9, 20, 16, 0.5)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.25)',
-    justifyContent: 'center', alignItems: 'center',
   },
   sheetWrap: { flex: 1 },
   sheet: {
@@ -200,11 +198,6 @@ const styles = StyleSheet.create({
     borderWidth: 1.2, borderColor: COLORS.border, overflow: 'hidden',
   },
   inputGroupError: { borderColor: COLORS.error },
-  inputPrefix: {
-    fontFamily: FONTS.medium, fontSize: 16, color: COLORS.textSecondary,
-    paddingHorizontal: SPACING.lg, paddingVertical: 16,
-    borderLeftWidth: 1, borderLeftColor: COLORS.divider,
-  },
   input: { flex: 1, fontFamily: FONTS.medium, fontSize: 17, color: COLORS.text, paddingVertical: 16, paddingHorizontal: SPACING.lg, alignContent: 'flex-start' },
   inputError: {
     fontFamily: FONTS.regular, fontSize: 12, color: COLORS.error,

@@ -4,7 +4,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, TextInput, Modal,
 } from 'react-native';
-import { ArrowRightIcon, CashIcon } from '../components/Icons';
+import { CashIcon } from '../components/Icons';
+import BackButton from '../components/BackButton';
 import { api } from '../services/api';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW, formatToman } from '../utils/theme';
 
@@ -64,9 +65,7 @@ export default function WalletScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.headerRow}>
-        <Pressable style={styles.backBtn} onPress={() => router.back()} accessibilityLabel="بازگشت">
-          <ArrowRightIcon size={18} />
-        </Pressable>
+        <BackButton onPress={() => router.back()} />
         <Text style={styles.title}>کیف پول</Text>
         <View style={{ width: 40 }} />
       </View>
@@ -168,11 +167,6 @@ const styles = StyleSheet.create({
   headerRow: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: SPACING.md,
     paddingHorizontal: SPACING.lg, paddingVertical: SPACING.md,
-  },
-  backBtn: {
-    width: 40, height: 40, borderRadius: RADIUS.sm,
-    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border,
-    justifyContent: 'center', alignItems: 'center',
   },
   title: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },

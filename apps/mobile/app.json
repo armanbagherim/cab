@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Cab - سامانه حمل و نقل تهران",
-    "slug": "cab",
+    "slug": "rahino",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -12,7 +12,8 @@
       "bundleIdentifier": "com.cab.app",
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم"
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "plugins": [
@@ -22,9 +23,23 @@
           "locationWhenInUsePermission": "برای نمایش موقعیت شما روی نقشه و یافتن سفیرهای نزدیک نیاز به دسترسی موقعیت داریم"
         }
       ],
+      "expo-notifications",
       "expo-secure-store",
       "expo-font",
       "expo-status-bar"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "fef6d9ad-4785-49c5-9979-001b659d0c01"
+      }
+    },
+    "owner": "armanbagherim",
+    "android": {
+      "package": "com.amirsporti.ir",
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    }
   }
 }

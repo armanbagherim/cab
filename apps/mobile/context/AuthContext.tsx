@@ -100,9 +100,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     api.setToken(null);
     setToken(null);
     setUser(null);
+    // Drop any nested stack first, then land on the Super App home page
+    // (`/home`) — NOT the cab login or the cab map screen. The cleanup below
+    // runs after the UI has already left the protected route.
     try { router.dismissAll(); } catch {}
-    router.replace('/');
-    // Persist cleanup after the UI has already left the protected route.
+    try { router.replace('/home' as any); } catch (e) {
+      console.warn('[Auth] logout navigation failed', e);
+    }
     await storage.removeItem('auth_token').catch(() => {});
     await storage.removeItem('auth_user').catch(() => {});
   }, []);

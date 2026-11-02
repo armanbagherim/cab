@@ -11,10 +11,16 @@ export const config = {
     perMinRate: 700, // تومان per minute
   },
   driverSearch: {
-    timeoutMs: 15000, // per-driver offer timeout
     searchWindowMs: 150000, // total bounded search window (~2.5 min)
     pollIntervalMs: 8000, // re-scan for newly-available drivers while waiting
     radiusStepsKm: [2, 5, 10, 20],
+    radiusExpandMs: 30000, // widen radius one step every 30 s of elapsed time
+    maxParallelOffers: 3, // active offers outstanding at any time per trip
+    offerTimeoutMs: 10000, // individual driver response deadline
+    maxOffersPerDriver: 2, // bounded retry policy within one run
+    reofferCooldownMs: 30000, // min gap before the same driver is re-offered
+    locationFreshnessMs: 10000, // max age of a driver fix for ordinary eligibility
+    locationGraceFactor: 6, // pool fallback age when no fresh drivers exist
   },
   location: {
     tehranBounds: {

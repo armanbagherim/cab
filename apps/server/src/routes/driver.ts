@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import prisma from '../utils/prisma';
 import { authMiddleware, requireRole } from '../middleware/auth';
-import { offeredTripsByDriver, ensureDispatch } from './trip';
+import { offeredTripsByDriver, ensureDispatch, getOfferState } from './trip';
 import { calculateDistance } from '../utils/helpers';
 
 const router = Router();
@@ -13,7 +13,15 @@ async function wakeWaitingTrips(driverId: string, source: string) {
     select: { id: true, status: true }, take: 100,
   });
   for (const trip of waitingTrips) {
-    if (trip.status === 'NO_DRIVER_AVAILABLE') await prisma.trip.update({ where: { id: trip.id }, data: { status: 'SEARCHING' } });
+    if (trip.status === 'NO_DRIVER_AVAILABLE') {
+      // Conditional transition: a concurrent accept/cancel must never be
+      // overwritten with SEARCHING by this wake path.
+      const up = await prisma.trip.updateMany({
+        where: { id: trip.id, driverId: null, status: 'NO_DRIVER_AVAILABLE' },
+        data: { status: 'SEARCHING' },
+      });
+      if (up.count !== 1) continue;
+    }
     ensureDispatch(trip.id);
   }
   console.log('[DISPATCH][DRIVER_AVAILABLE_WAKE]', { driverId, source, waitingTrips });
@@ -171,9 +179,15 @@ router.get('/active-trip', authMiddleware, requireRole('DRIVER'), async (req: Re
   res.json({ success: true, data: trip });
 });
 
-// Pending offers for a driver (HTTP polling fallback for socket drops)
+// Pending offers for a driver (HTTP polling fallback for socket drops).
+// Derived from the live offer registry, then validated against the DB: only
+// offers whose trip is genuinely OFFERED and whose server-side expiry is in
+// the future are returned, so expired offers are never revived into
+// actionable client state. New fields (`offerId`, `offerExpiresAt`) are
+// additive; existing payload shape is unchanged.
 router.get('/pending-offers', authMiddleware, requireRole('DRIVER'), async (req: Request, res: Response) => {
   const driverId = req.user!.userId;
+  const now = Date.now();
   const offeredSet = offeredTripsByDriver.get(driverId);
   if (!offeredSet || offeredSet.size === 0) {
     res.json({ success: true, data: [] });
@@ -190,26 +204,30 @@ router.get('/pending-offers', authMiddleware, requireRole('DRIVER'), async (req:
 
   const driverStatus = await prisma.driverStatus.findUnique({ where: { userId: driverId } });
 
-  const offers = trips.map((t) => ({
-    tripId: t.id,
-    originLat: t.originLat,
-    originLng: t.originLng,
-    originAddress: t.originAddress,
-    destLat: t.destLat,
-    destLng: t.destLng,
-    destAddress: t.destAddress,
-    distanceKm: t.distanceKm,
-    durationMin: t.durationMin,
-    estimatedPrice: t.estimatedPrice,
-    driverDistanceKm: driverStatus?.latitude && driverStatus?.longitude
-      ? Math.round(
-          (Math.hypot(
-            (t.originLat - driverStatus.latitude) * 111,
-            (t.originLng - driverStatus.longitude) * 88
-          )) * 10
-        ) / 10
-      : null,
-  }));
+  const offers = [];
+  for (const t of trips) {
+    const offer = getOfferState(t.id, driverId);
+    if (!offer || now >= offer.expiresAtMs) continue; // stale: never restore expired offers
+    offers.push({
+      tripId: t.id,
+      originLat: t.originLat,
+      originLng: t.originLng,
+      originAddress: t.originAddress,
+      destLat: t.destLat,
+      destLng: t.destLng,
+      destAddress: t.destAddress,
+      distanceKm: t.distanceKm,
+      durationMin: t.durationMin,
+      estimatedPrice: t.estimatedPrice,
+      driverDistanceKm: driverStatus?.latitude != null && driverStatus?.longitude != null
+        ? Math.round(
+            calculateDistance(t.originLat, t.originLng, driverStatus.latitude, driverStatus.longitude) * 10
+          ) / 10
+        : null,
+      offerId: offer.offerId,
+      offerExpiresAt: new Date(offer.expiresAtMs).toISOString(),
+    });
+  }
 
   res.json({ success: true, data: offers });
 });

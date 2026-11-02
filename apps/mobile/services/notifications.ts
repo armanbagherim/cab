@@ -1,4 +1,5 @@
 import { Platform } from 'react-native';
+import { isRunningInExpoGo } from 'expo';
 
 /**
  * Reusable event-notification layer.
@@ -31,11 +32,14 @@ type ExpoNotifications = {
   }): void;
   setNotificationChannelAsync(id: string, opts: any): Promise<any>;
   scheduleNotificationAsync(n: any): Promise<string>;
+  getPermissionsAsync(): Promise<{ status: string; granted?: boolean }>;
   requestPermissionsAsync(): Promise<any>;
 };
 
 let expoNotif: ExpoNotifications | null = null;
 let initialized = false;
+let initializing: Promise<string[]> | null = null;
+const pendingNativeNotifications: AppNotification[] = [];
 let webAudioCtx: AudioContext | null = null;
 let audioUnlocked = false;
 const notifiedTags = new Set<string>();
@@ -49,9 +53,22 @@ export interface AppNotification {
 
 async function loadExpoNotifications(): Promise<ExpoNotifications | null> {
   if (Platform.OS !== 'web') {
+    // Expo Go (Android): `expo-notifications` eagerly requires a native
+    // topic-subscription module Expo Go does not ship, so even the import
+    // fails. Detect Expo Go natively (native `ExpoGo` module presence).
+    if (isRunningInExpoGo()) return null;
     try {
       const mod = await import('expo-notifications');
-      return mod as unknown as ExpoNotifications;
+      const candidate = mod as unknown as ExpoNotifications;
+      // Guard against a partially-evaluated module in Expo Go.
+      if (
+        typeof candidate?.setNotificationHandler !== 'function' ||
+        typeof candidate?.scheduleNotificationAsync !== 'function' ||
+        typeof candidate?.getPermissionsAsync !== 'function'
+      ) {
+        return null;
+      }
+      return candidate;
     } catch (e) {
       console.warn('[Notifications] expo-notifications unavailable:', (e as Error).message);
       return null;
@@ -63,7 +80,16 @@ async function loadExpoNotifications(): Promise<ExpoNotifications | null> {
 /** Establish the platform plumbing. Called from role screens; safe to repeat. */
 export async function initNotifications(): Promise<string[]> {
   if (initialized) return [];
-  initialized = true;
+  if (initializing) return initializing;
+  initializing = initNotificationsImpl();
+  try {
+    return await initializing;
+  } finally {
+    initializing = null;
+  }
+}
+
+async function initNotificationsImpl(): Promise<string[]> {
   const limitations: string[] = [];
 
   if (Platform.OS === 'web') {
@@ -89,8 +115,9 @@ export async function initNotifications(): Promise<string[]> {
       document.removeEventListener('keydown', unlock);
     };
     document.addEventListener('pointerdown', unlock);
-    document.addEventListener('keydown', unlock);
-    return limitations;
+      document.addEventListener('keydown', unlock);
+      initialized = true;
+      return limitations;
   }
 
   // Native: Expo local notifications.
@@ -117,6 +144,13 @@ export async function initNotifications(): Promise<string[]> {
       });
     }
     await expoNotif.requestPermissionsAsync();
+    const permission = await expoNotif.getPermissionsAsync();
+    if (permission.status !== 'granted' && !permission.granted) {
+      limitations.push('دسترسی اعلان تأیید نشده است');
+    }
+    initialized = true;
+    const pending = pendingNativeNotifications.splice(0);
+    pending.forEach(scheduleNativeNotification);
   } catch (e) {
     console.warn('[Notifications] init failed:', (e as Error).message);
     limitations.push('دسترسی اعلان تأمین نشد');
@@ -177,13 +211,26 @@ export function notifyEvent(n: AppNotification): void {
     return;
   }
 
+  if (!expoNotif) {
+    // Socket events can arrive while permission/channel setup is still
+    // asynchronous. Keep bounded, deduplicated events until initialization
+    // completes instead of silently losing the notification.
+    if (!initialized && pendingNativeNotifications.length < 20) {
+      pendingNativeNotifications.push(n);
+    }
+    return;
+  }
+  scheduleNativeNotification(n);
+}
+
+function scheduleNativeNotification(n: AppNotification): void {
   if (!expoNotif) return;
   // Small delay so a screen transition never clips the banner scheduling.
   setTimeout(() => {
     expoNotif!
       .scheduleNotificationAsync({
         // channel stays grouped on one professional channel on Android
-        content: { title: n.title, body: n.body || '', sound: true },
+        content: { title: n.title, body: n.body || '', sound: true, channelId: 'ride-events' },
         trigger: null,
       })
       .catch((e) => console.warn('[Notifications] schedule failed:', (e as Error).message));
