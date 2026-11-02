@@ -4,6 +4,8 @@ import prisma from '../utils/prisma';
 import { authMiddleware, requireRole } from '../middleware/auth';
 import { offeredTripsByDriver, ensureDispatch, getOfferState } from './trip';
 import { calculateDistance } from '../utils/helpers';
+import { config } from '../config';
+import { isDriverConnected } from '../socket/handler';
 
 const router = Router();
 
@@ -36,14 +38,16 @@ router.get('/nearby', authMiddleware, async (req: Request, res: Response) => {
   }
   const drivers = await prisma.driverStatus.findMany({
     where: { isOnline: true, isAccepting: true, latitude: { not: null }, longitude: { not: null } },
-    select: { userId: true, latitude: true, longitude: true, heading: true, isAccepting: true, selectedActive: true, selectedLat: true, selectedLng: true },
+      select: { userId: true, latitude: true, longitude: true, heading: true, isAccepting: true, selectedActive: true, selectedLat: true, selectedLng: true, updatedAt: true, user: { select: { isActive: true } } },
   });
-  const data = drivers
+    const data = drivers
+    .filter((driver) => driver.user.isActive && isDriverConnected(driver.userId) && Date.now() - driver.updatedAt.getTime() <= config.driverSearch.staleDriverMs)
     .map((driver) => ({ ...driver, distanceKm: calculateDistance(latitude, longitude, driver.latitude!, driver.longitude!) }))
     .filter((driver) => driver.distanceKm <= 15)
     .sort((a, b) => a.distanceKm - b.distanceKm)
-    .map(({ userId, latitude: lat, longitude: lng, heading, isAccepting, selectedActive, selectedLat, selectedLng, distanceKm }) => ({
+    .map(({ userId, latitude: lat, longitude: lng, heading, isAccepting, selectedActive, selectedLat, selectedLng, updatedAt, distanceKm }) => ({
       id: userId, latitude: lat, longitude: lng, heading, isAccepting, selectedActive, selectedLat, selectedLng,
+      lastSeenAt: updatedAt.toISOString(),
       distanceKm: Math.round(distanceKm * 10) / 10,
     }));
   res.json({ success: true, data });
@@ -97,7 +101,9 @@ router.put('/status', authMiddleware, requireRole('DRIVER'), async (req: Request
 
     const status = await prisma.driverStatus.update({
       where: { userId: req.user!.userId },
-      data: body,
+      data: (body.isOnline === false || body.isAccepting === false)
+        ? { ...body, selectedActive: false, selectedLat: null, selectedLng: null }
+        : body,
     });
     console.log('[DRIVER_STATUS_HTTP]', { userId: req.user!.userId, body, persisted: { isOnline: status.isOnline, isAccepting: status.isAccepting, latitude: status.latitude, longitude: status.longitude } });
     if (status.isOnline && status.isAccepting) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react';
-import { I18nManager, Platform } from 'react-native';
+import { I18nManager, Platform, StyleSheet, View } from 'react-native';
 import { useFonts } from 'expo-font';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -23,7 +23,7 @@ function useIosSwipeBackGuard() {
     if (Platform.OS !== 'web') return;
     const style = document.createElement('style');
     style.setAttribute('data-rahino-swipe-guard', '');
-    style.textContent = 'html, body { overscroll-behavior-x: none; }';
+     style.textContent = 'html, body, #root { height: 100%; min-height: 100%; margin: 0; } body { overscroll-behavior-x: none; background: #EDEFF2; }';
     document.head.appendChild(style);
 
     let startX = 0;
@@ -96,6 +96,7 @@ export default function RootLayout() {
       >
         <Stack.Screen name="index" />
         <Stack.Screen name="home" />
+        <Stack.Screen name="cab" />
         <Stack.Screen name="login" />
         <Stack.Screen name="verify-otp" />
         <Stack.Screen name="profile" />
@@ -111,8 +112,20 @@ export default function RootLayout() {
     <SafeAreaProvider>
       <StatusBar style="dark" />
       {fontsLoaded || fontError ? (
-        <AuthProvider>{screens}</AuthProvider>
+        <View style={styles.viewport}>
+          <AuthProvider>{screens}</AuthProvider>
+        </View>
       ) : null}
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  viewport: {
+    flex: 1,
+    width: '100%',
+    maxWidth: 480,
+    alignSelf: 'center',
+    backgroundColor: COLORS.bg,
+  },
+});

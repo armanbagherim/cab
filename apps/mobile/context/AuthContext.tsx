@@ -68,14 +68,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const t = await storage.getItem('auth_token');
       const u = await storage.getItem('auth_user');
       if (t && u) {
-        const parsed = JSON.parse(u) as User;
+        JSON.parse(u) as User;
         api.setToken(t);
+        const current = await api.getProfile();
         setToken(t);
-        setUser(parsed);
+        setUser(current);
       }
     } catch (e) {
       // corrupted storage — behave as signed out
       api.setToken(null);
+      await storage.removeItem('auth_token').catch(() => {});
+      await storage.removeItem('auth_user').catch(() => {});
     }
   }
 

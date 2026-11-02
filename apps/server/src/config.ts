@@ -21,6 +21,7 @@ export const config = {
     reofferCooldownMs: 30000, // min gap before the same driver is re-offered
     locationFreshnessMs: 10000, // max age of a driver fix for ordinary eligibility
     locationGraceFactor: 6, // pool fallback age when no fresh drivers exist
+    staleDriverMs: 60 * 60 * 1000, // stale presence is never eligible or visible
   },
   location: {
     tehranBounds: {

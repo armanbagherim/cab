@@ -5,6 +5,7 @@ import {
   View, Text, TextInput, StyleSheet, Pressable, ActivityIndicator,
   FlatList, KeyboardAvoidingView, Platform,
 } from 'react-native';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import { CabMap, NeshanMapRef } from '../../components/CabMap';
 import { LocateIcon, LocateOffIcon, SearchIcon, LogoutIcon, CloseIcon, ClockIcon, RoadIcon, HistoryIcon, PersonIcon, MenuIcon } from '../../components/Icons';
@@ -21,8 +22,9 @@ type LocationPhase = 'idle' | 'acquiring' | 'error';
 
 const TEHRAN = { lat: 35.6892, lng: 51.389 };
 
-/** Addresses resolved at confirmation time, cached by normalized coordinate. */
-let geocodeCache: Record<string, string> = {};
+/** Final reverse-geocode results are cached for this app session. */
+let reverseGeocodeCache: Record<string, string> = {};
+const reverseGeocodeInflight: Partial<Record<string, Promise<string>>> = {};
 /** Fare/route lookups cached per confirmed pair so re-entering the preview
  * stage never repeats a successful request; a changed point = a new key. */
 interface CachedEstimate {
@@ -70,27 +72,26 @@ export default function PassengerHomeScreen() {
   const [creatingTrip, setCreatingTrip] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'WALLET'>('CASH');
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
-  const [nearbyDrivers, setNearbyDrivers] = useState<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number }>>([]);
+  const [nearbyDrivers, setNearbyDrivers] = useState<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number; lastSeenAt?: string | number }>>([]);
   const [tripError, setTripError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const panelH = useRef(0);
+  const reverseKeyRef = useRef<string | null>(null);
+  const reverseAbortRef = useRef<AbortController | null>(null);
 
-  // ---- Reverse geocoding: single cached lookup per CONFIRMED point -------------
-  // The service is expensive: it is never called while the user pans, zooms
-  // or browses search results. Lookups happen only when a point is explicitly
-  // confirmed (or on-demand for the preview), behind this cache; failures keep
-  // the neutral fallback (no fabricated address) and stay retryable.
-  const resolveAddress = useCallback(async (lat: number, lng: number): Promise<string> => {
+  const resolveAddress = useCallback((lat: number, lng: number, signal: AbortSignal) => {
     const key = coordKey(lat, lng);
-    const cached = geocodeCache[key];
-    if (cached) return cached;
-    try {
-      const r = await api.reverseGeocode(lat, lng);
-      if (r?.address) geocodeCache[key] = r.address;
-      return r?.address || '';
-    } catch {
-      return ''; // neutral fallback, no fabricated address
-    }
+    if (reverseGeocodeCache[key]) return Promise.resolve(reverseGeocodeCache[key]);
+    if (reverseGeocodeInflight[key]) return reverseGeocodeInflight[key];
+    const request = api.reverseGeocode(lat, lng, signal)
+      .then((result) => {
+        const address = result?.address || '';
+        if (address) reverseGeocodeCache[key] = address;
+        return address;
+      })
+      .finally(() => { delete reverseGeocodeInflight[key]; });
+    reverseGeocodeInflight[key] = request;
+    return request;
   }, []);
 
   // Reported by the map itself after every camera settle.
@@ -192,7 +193,7 @@ export default function PassengerHomeScreen() {
         console.log('[Passenger][NEARBY_SOCKET_LOCATION]', driver);
         if (!driver?.id || !driver.isOnline || !driver.isAccepting) return;
         setNearbyDrivers((prev) => {
-          const next = { id: driver.id, latitude: driver.latitude, longitude: driver.longitude, heading: driver.heading, isAccepting: true, distanceKm: 0 };
+           const next = { id: driver.id, latitude: driver.latitude, longitude: driver.longitude, heading: driver.heading, isAccepting: true, distanceKm: 0, lastSeenAt: Date.now() };
           return prev.some((item) => item.id === next.id) ? prev.map((item) => item.id === next.id ? { ...item, ...next } : item) : [...prev, next];
         });
       }),
@@ -206,7 +207,10 @@ export default function PassengerHomeScreen() {
       socketService.onConnect(refresh),
     ];
     refresh();
-    const timer = setInterval(refresh, 30_000);
+    const timer = setInterval(() => {
+      setNearbyDrivers((prev) => prev.filter((driver) => !driver.lastSeenAt || Date.now() - new Date(driver.lastSeenAt).getTime() <= 60 * 60 * 1000));
+      refresh();
+    }, 30_000);
     return () => { active = false; clearInterval(timer); if (retryTimer) clearTimeout(retryTimer); unsubs.forEach((unsubscribe) => unsubscribe()); };
   }, [token]));
 
@@ -250,9 +254,6 @@ export default function PassengerHomeScreen() {
       cameraCommandSeq.current += 1;
       mapRef.current?.animateTo(lat, lng, 16.5);
       centerRef.current = { lat, lng, addr: '' };
-      // Seed the address cache with the provider's own data — no geocode call needed.
-      const addr = [item.title, item.address].filter(Boolean).join('، ');
-      if (addr) geocodeCache[coordKey(lat, lng)] = addr;
     }
     setSearchOpen(false);
     setSearchQ('');
@@ -260,33 +261,25 @@ export default function PassengerHomeScreen() {
   }, []);
 
   // ---- Explicit stage transitions ---------------------------------------------
-  // Confirming a point snapshots the coordinate immediately; its address is
-  // then filled in from the single cached lookup (or the provider fallback)
-  // without ever re-associating the address with a different coordinate.
+  // Confirming a point only snapshots local coordinates. Address resolution
+  // starts once both points are finalized below.
   const confirmOrigin = useCallback(() => {
     const c = centerRef.current;
-    const point: Point = { lat: c.lat, lng: c.lng, addr: 'موقعیت انتخاب‌شده' };
+    const point: Point = { lat: c.lat, lng: c.lng, addr: '' };
     setEstimate(null);
     setEstimateError(null);
     // If a destination already exists (origin edited later) → back to review,
     // keeping the untouched destination. Never silently erase it.
     setStage(dest ? 'result' : 'dest');
     setOrigin(point);
-    resolveAddress(point.lat, point.lng).then((addr) => {
-      // Guard: user may have re-confirmed a different point meanwhile.
-      setOrigin((p) => (p && p.lat === point.lat && p.lng === point.lng ? { ...p, addr: addr || p.addr } : p));
-    });
-  }, [dest, resolveAddress]);
+  }, [dest]);
 
   const confirmDest = useCallback(() => {
     const c = centerRef.current;
-    const point: Point = { lat: c.lat, lng: c.lng, addr: 'موقعیت انتخاب‌شده' };
+    const point: Point = { lat: c.lat, lng: c.lng, addr: '' };
     setDest(point);
     setStage('result');
-    resolveAddress(point.lat, point.lng).then((addr) => {
-      setDest((p) => (p && p.lat === point.lat && p.lng === point.lng ? { ...p, addr: addr || p.addr } : p));
-    });
-  }, [resolveAddress]);
+  }, []);
 
   const editOrigin = useCallback(() => {
     setStage('origin');
@@ -328,10 +321,6 @@ export default function PassengerHomeScreen() {
       };
       estimateCache[key] = stored;
       setEstimate(stored);
-      // Lookups resolved with the estimate are authoritative for these exact
-      // coordinates — fill the itinerary rows without extra geocode calls.
-      if (r.originAddress) geocodeCache[coordKey(o.lat, o.lng)] = r.originAddress;
-      if (r.destAddress) geocodeCache[coordKey(d.lat, d.lng)] = r.destAddress;
     } catch (e: any) {
       setEstimate(null);
       setEstimateError(e?.message && e.message !== 'Request failed' ? e.message : 'محاسبه کرایه ممکن نشد. دوباره تلاش کنید.');
@@ -372,6 +361,31 @@ export default function PassengerHomeScreen() {
   }, [stage]);
 
   useEffect(() => {
+    if (stage !== 'result' || !origin || !dest) return;
+    const key = `${coordKey(origin.lat, origin.lng)}|${coordKey(dest.lat, dest.lng)}`;
+    if (reverseKeyRef.current !== key) {
+      reverseAbortRef.current?.abort();
+      reverseKeyRef.current = key;
+      reverseAbortRef.current = new AbortController();
+    }
+    const controller = reverseAbortRef.current || new AbortController();
+    reverseAbortRef.current = controller;
+    const signal = controller.signal;
+    const originPoint = { lat: origin.lat, lng: origin.lng };
+    const destPoint = { lat: dest.lat, lng: dest.lng };
+    Promise.all([
+      resolveAddress(originPoint.lat, originPoint.lng, signal),
+      resolveAddress(destPoint.lat, destPoint.lng, signal),
+    ]).then(([originAddress, destAddress]) => {
+      if (reverseKeyRef.current !== key || signal.aborted) return;
+      setOrigin((point) => point && coordKey(point.lat, point.lng) === coordKey(originPoint.lat, originPoint.lng)
+        ? { ...point, addr: originAddress || point.addr } : point);
+      setDest((point) => point && coordKey(point.lat, point.lng) === coordKey(destPoint.lat, destPoint.lng)
+        ? { ...point, addr: destAddress || point.addr } : point);
+    }).catch(() => {});
+  }, [stage, origin?.lat, origin?.lng, dest?.lat, dest?.lng, resolveAddress]);
+
+  useEffect(() => {
     const coordinates = routeLine?.coordinates;
     if (stage === 'result' && coordinates && coordinates.length > 1) {
       mapRef.current?.fitToCoordinates(coordinates, 260);
@@ -393,14 +407,29 @@ export default function PassengerHomeScreen() {
     setCreatingTrip(true);
     setTripError(null);
     try {
-      const trip = await api.createTrip(origin.lat, origin.lng, origin.addr, dest.lat, dest.lng, dest.addr, paymentMethod);
+      const key = `${coordKey(origin.lat, origin.lng)}|${coordKey(dest.lat, dest.lng)}`;
+      if (reverseKeyRef.current !== key) {
+        reverseAbortRef.current?.abort();
+        reverseKeyRef.current = key;
+        reverseAbortRef.current = new AbortController();
+      }
+      const reverseController = reverseAbortRef.current || new AbortController();
+      reverseAbortRef.current = reverseController;
+      const reverseSignal = reverseController.signal;
+      const [originAddress, destAddress] = await Promise.all([
+        origin.addr || resolveAddress(origin.lat, origin.lng, reverseSignal),
+        dest.addr || resolveAddress(dest.lat, dest.lng, reverseSignal),
+      ]);
+      setOrigin((point) => point && coordKey(point.lat, point.lng) === coordKey(origin.lat, origin.lng) ? { ...point, addr: originAddress } : point);
+      setDest((point) => point && coordKey(point.lat, point.lng) === coordKey(dest.lat, dest.lng) ? { ...point, addr: destAddress } : point);
+      const trip = await api.createTrip(origin.lat, origin.lng, originAddress, dest.lat, dest.lng, destAddress, paymentMethod);
       router.push({ pathname: '/(passenger)/active-trip', params: { tripId: trip.id } } as any);
     } catch (e: any) {
       setTripError(e?.message && e.message !== 'Request failed' ? e.message : 'ثبت درخواست سفر ناموفق بود. دوباره تلاش کنید.');
     } finally {
       setCreatingTrip(false);
     }
-  }, [origin, dest, creatingTrip, estimate, paymentMethod, walletBalance, router]);
+  }, [origin, dest, creatingTrip, estimate, paymentMethod, walletBalance, router, resolveAddress]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -414,19 +443,21 @@ export default function PassengerHomeScreen() {
   // the Super App home. Enforce the destination here too so a failure in the
   // global navigation never leaves the app stuck inside the cab section.
   useEffect(() => {
-    if (!isLoading && !user) router.replace('/home' as any);
+    if (!isLoading && !user) router.replace({ pathname: '/login', params: { role: 'PASSENGER' } } as any);
   }, [user, isLoading, router]);
 
   // ---- Derived, remount-safe map data ------------------------------------------
   const markers = useMemo(() => {
-    const m: Array<{ id: string; latitude: number; longitude: number; color?: string; label?: string; glyph?: 'dot' | 'car' }> = nearbyDrivers.map((driver) => ({
+    const m: Array<{ id: string; latitude: number; longitude: number; color?: string; label?: string; glyph?: 'dot' | 'car' }> = nearbyDrivers
+      .filter((driver) => driver.isAccepting && (!driver.lastSeenAt || Date.now() - new Date(driver.lastSeenAt).getTime() <= 60 * 60 * 1000))
+      .map((driver) => ({
       id: `driver-${driver.id}`,
       latitude: driver.latitude,
       longitude: driver.longitude,
       heading: driver.heading,
       color: '#2563EB',
       glyph: 'car',
-    }));
+      }));
     if (origin) m.push({ id: 'origin', latitude: origin.lat, longitude: origin.lng, color: COLORS.pinOrigin, label: 'مبدأ' });
     if (stage === 'result' && dest) m.push({ id: 'dest', latitude: dest.lat, longitude: dest.lng, color: COLORS.pinDest, label: 'مقصد' });
     return m;
@@ -571,13 +602,19 @@ export default function PassengerHomeScreen() {
             key: 'trips',
             label: 'سفرهای من',
             icon: <HistoryIcon size={20} color={COLORS.textSecondary} />,
-            onPress: () => router.push('/(passenger)/trip-history'),
+           onPress: () => router.push('/(passenger)/trip-history'),
           },
           {
             key: 'profile',
             label: 'پروفایل',
             icon: <PersonIcon size={20} color={COLORS.textSecondary} />,
-            onPress: () => router.push('/profile'),
+           onPress: () => router.push('/profile'),
+         },
+          {
+            key: 'home',
+            label: 'صفحه اصلی',
+            icon: <MaterialCommunityIcons name="home-outline" size={20} color={COLORS.textSecondary} />,
+            onPress: () => router.replace('/home' as any),
           },
           {
             key: 'logout',
@@ -736,7 +773,7 @@ export default function PassengerHomeScreen() {
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.bg },
+  container: { flex: 1, backgroundColor: COLORS.bg, position: 'relative' },
   mapArea: { flex: 1 },
 
   locateOverlay: { position: 'absolute', left: 0, right: 0, alignItems: 'center', zIndex: 60 },

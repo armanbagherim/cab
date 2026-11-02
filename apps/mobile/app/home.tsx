@@ -1,9 +1,10 @@
-import React, { useEffect, useRef } from 'react';
+import React from 'react';
 import { useRouter } from 'expo-router';
 import { View, Text, StyleSheet, Pressable, ScrollView, Linking } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { useAuth } from '../context/AuthContext';
+import { api } from '../services/api';
 import { COLORS, FONTS, SPACING, RADIUS, SHADOW } from '../utils/theme';
 
 /**
@@ -20,13 +21,6 @@ export default function RoleSelect() {
   const { user, isLoading } = useAuth();
   const insets = useSafeAreaInsets();
 
-  // Redirect whenever the auth state resolves to a logged-in user.
-  // We intentionally do NOT use a ref guard so that after logout (user → null)
-  // and a subsequent login the redirect fires again correctly.
-  useEffect(() => {
-    if (isLoading || !user) return;
-    if (user.role === 'DRIVER') router.replace('/(driver)' as any);
-  }, [user, isLoading, router]);
   if (isLoading) return <View style={styles.splash} />;
   if (user) return <ServiceHub />;
 
@@ -92,8 +86,24 @@ export default function RoleSelect() {
 function ServiceHub() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { user, login } = useAuth();
+  const enterPassenger = async () => {
+    if (user?.role === 'DRIVER') {
+      const switched = await api.switchRole('PASSENGER');
+      await login(switched.token, switched.user);
+    }
+    router.push('/cab' as any);
+  };
+  const enterDriver = async () => {
+    if (user?.role !== 'DRIVER') {
+      const switched = await api.switchRole('DRIVER');
+      await login(switched.token, switched.user);
+    }
+    router.push('/(driver)' as any);
+  };
   const services = [
-    { title: 'تاکسی', caption: 'سفر شهری سریع و مطمئن', icon: 'taxi', action: () => router.push('/(passenger)' as any), primary: true },
+    { title: 'تاکسی', caption: 'سفر شهری سریع و مطمئن', icon: 'taxi', action: enterPassenger, primary: true },
+    ...(user?.driverStatus ? [{ title: 'پنل سفیر', caption: 'مدیریت سفرها و وضعیت کاری', icon: 'steering', action: enterDriver, primary: false }] : []),
     { title: 'شاپ', caption: 'خرید و خدمات آنلاین', icon: 'shopping-outline', url: 'https://jahizan.com' },
     { title: 'گارانتی و خدمات', caption: 'پشتیبانی و خدمات پس از فروش', icon: 'shield-check-outline', url: 'https://ariakish.com' },
     { title: 'فروش آنلاین طلا', caption: 'خرید امن طلای آنلاین', icon: 'gold', url: 'https://pegahgold.ir' },
@@ -104,7 +114,7 @@ function ServiceHub() {
         <View><Text style={styles.hubEyebrow}>خدمات روزمره شما</Text><Text style={styles.hubTitle}>راهینو</Text></View>
         <View style={styles.hubMark}><MaterialCommunityIcons name="map-marker-path" size={24} color="#fff" /></View>
       </View>
-      <View style={styles.banner}><Text style={styles.bannerTitle}>هر مسیر، یک انتخاب ساده</Text><Text style={styles.bannerText}>از حمل‌ونقل تا خرید و خدمات، همه در راهینو</Text><View style={styles.bannerButton}><Text style={styles.bannerButtonText}>شروع کنید</Text></View></View>
+      <Pressable style={styles.banner} onPress={enterPassenger}><Text style={styles.bannerTitle}>هر مسیر، یک انتخاب ساده</Text><Text style={styles.bannerText}>از حمل‌ونقل تا خرید و خدمات، همه در راهینو</Text><View style={styles.bannerButton}><Text style={styles.bannerButtonText}>شروع کنید</Text></View></Pressable>
       <Text style={styles.hubSection}>خدمات راهینو</Text>
       <View style={styles.serviceGrid}>
         {services.map((service) => (
@@ -115,6 +125,10 @@ function ServiceHub() {
           </Pressable>
         ))}
       </View>
+      <Pressable style={styles.passengerEntry} onPress={enterPassenger}>
+        <MaterialCommunityIcons name="account-arrow-right-outline" size={21} color={COLORS.brand} />
+        <Text style={styles.passengerEntryText}>ورود / ثبت‌نام مسافر</Text>
+      </Pressable>
     </ScrollView>
   );
 }
@@ -153,6 +167,8 @@ const styles = StyleSheet.create({
   serviceTitlePrimary: { color: '#fff' },
   serviceCaption: { fontFamily: FONTS.regular, fontSize: 11, color: COLORS.textSecondary, textAlign: 'right', marginTop: 4 },
   serviceCaptionPrimary: { color: '#D1D5DB' },
+  passengerEntry: { flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: SPACING.xl, paddingVertical: 13, borderRadius: RADIUS.lg, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.surface },
+  passengerEntryText: { fontFamily: FONTS.semibold, fontSize: 13, color: COLORS.brand },
   top: { alignItems: 'center', paddingTop: SPACING.lg },
   badge: {
     width: 56, height: 56, borderRadius: RADIUS.lg,

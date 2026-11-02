@@ -67,13 +67,15 @@ router.post('/verify-otp', async (req: Request, res: Response) => {
     let user = await prisma.user.findUnique({ where: { phone: sanitized } });
 
     if (user) {
-      // Existing user - don't change role
-      if (user.role !== body.role) {
-        res.status(400).json({
-          success: false,
-          error: `این شماره با نقش ${user.role === 'PASSENGER' ? 'مسافر' : 'سفیر'} ثبت شده است`,
+      // A driver account is also a passenger account. Promote a passenger to
+      // driver capability on first driver login, but keep the requested mode
+      // in the token so the same account can switch modes safely.
+      if (body.role === 'DRIVER' && user.role !== 'DRIVER') {
+        user = await prisma.$transaction(async (tx) => {
+          const updated = await tx.user.update({ where: { id: user!.id }, data: { role: 'DRIVER' } });
+          await tx.driverStatus.upsert({ where: { userId: updated.id }, create: { userId: updated.id }, update: {} });
+          return updated;
         });
-        return;
       }
     } else {
       // New user
@@ -125,9 +127,10 @@ router.post('/verify-otp', async (req: Request, res: Response) => {
     const token = generateToken({
       userId: user.id,
       phone: user.phone,
-      role: user.role as 'PASSENGER' | 'DRIVER',
+      role: body.role,
     });
 
+    const driverStatus = await prisma.driverStatus.findUnique({ where: { userId: user.id } });
     res.json({
       success: true,
       data: {
@@ -137,7 +140,8 @@ router.post('/verify-otp', async (req: Request, res: Response) => {
           firstName: user.firstName,
           lastName: user.lastName,
           phone: user.phone,
-          role: user.role,
+          role: body.role,
+          driverStatus,
         },
       },
     });
@@ -148,6 +152,28 @@ router.post('/verify-otp', async (req: Request, res: Response) => {
     }
     res.status(500).json({ success: false, error: 'Internal error' });
   }
+});
+
+router.post('/switch-role', authMiddleware, async (req: Request, res: Response) => {
+  const role = z.enum(['PASSENGER', 'DRIVER']).safeParse(req.body?.role);
+  if (!role.success) {
+    res.status(400).json({ success: false, error: 'نقش نامعتبر است' });
+    return;
+  }
+  const user = await prisma.user.findUnique({ where: { id: req.user!.userId }, include: { driverStatus: true } });
+  if (!user || !user.isActive) {
+    res.status(401).json({ success: false, error: 'حساب کاربری معتبر نیست' });
+    return;
+  }
+  if (role.data === 'DRIVER' && !user.driverStatus) {
+    res.status(403).json({ success: false, error: 'حساب سفیری برای این کاربر فعال نیست' });
+    return;
+  }
+  const token = generateToken({ userId: user.id, phone: user.phone, role: role.data });
+  res.json({ success: true, data: {
+    token,
+    user: { id: user.id, firstName: user.firstName, lastName: user.lastName, phone: user.phone, role: role.data, driverStatus: user.driverStatus },
+  } });
 });
 
 // Get current user profile
@@ -167,14 +193,14 @@ router.get('/profile', authMiddleware, async (req: Request, res: Response) => {
       firstName: user.firstName,
       lastName: user.lastName,
       phone: user.phone,
-      role: user.role,
+       role: req.user!.role,
       driverStatus: user.driverStatus,
     },
   });
 });
 
 // Update editable profile fields. Phone is a verified identifier and is
-// intentionally immutable; role changes are not supported.
+// intentionally immutable; mode switching is handled by /switch-role.
 const updateProfileSchema = z.object({
   firstName: z.string().min(2).max(50),
   lastName: z.string().min(2).max(50),
@@ -195,7 +221,7 @@ router.put('/profile', authMiddleware, async (req: Request, res: Response) => {
         firstName: user.firstName,
         lastName: user.lastName,
         phone: user.phone,
-        role: user.role,
+         role: req.user!.role,
         driverStatus: user.driverStatus,
       },
     });

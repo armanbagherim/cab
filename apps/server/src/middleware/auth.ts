@@ -29,7 +29,8 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
 
 export function requireRole(...roles: string[]) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (!req.user || !roles.includes(req.user.role)) {
+    const passengerCapability = roles.includes('PASSENGER') && req.user?.role === 'DRIVER';
+    if (!req.user || (!roles.includes(req.user.role) && !passengerCapability)) {
       res.status(403).json({ success: false, error: 'Forbidden' });
       return;
     }

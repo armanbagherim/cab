@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
-  View, Text, StyleSheet, Pressable, ActivityIndicator,
+  View, Text, StyleSheet, Pressable, ActivityIndicator, Animated,
 } from 'react-native';
 import { api } from '../../services/api';
 import { socketService } from '../../services/socket';
@@ -23,7 +23,7 @@ import { Trip, TripStatus } from '../../types';
  * Nothing is declared before the backend reports it.
  */
 const STATUS_META: Record<TripStatus, { label: string; tone: 'searching' | 'info' | 'ok' | 'error' }> = {
-  SEARCHING: { label: 'در حال ارسال درخواست به سفیران...', tone: 'searching' },
+  SEARCHING: { label: 'در حال پیدا کردن سفیر مناسب...', tone: 'searching' },
   OFFERED: { label: 'درخواست به سفیران ارسال شد؛ در انتظار پذیرش...', tone: 'searching' },
   ACCEPTED: { label: 'سفیر سفر را پذیرفت', tone: 'ok' },
   DRIVER_ARRIVING: { label: 'سفیر در مسیر رسیدن به مبدأ', tone: 'ok' },
@@ -243,7 +243,7 @@ export default function ActiveTripScreen() {
     setCancelling(true);
     try {
       await api.cancelTrip(trip.id);
-      router.replace('/(passenger)');
+      router.replace('/cab');
     } catch (e: any) {
       localCancel.current = false;
       setDialogError(e?.message || 'لغو ناموفق بود. دوباره تلاش کنید');
@@ -294,7 +294,7 @@ export default function ActiveTripScreen() {
         <Text style={[s.centerText, { marginTop: SPACING.md }]}>
           {error || 'سفر فعالی یافت نشد'}
         </Text>
-        <Pressable style={s.btnPrimary} onPress={() => router.replace('/(passenger)')}>
+        <Pressable style={s.btnPrimary} onPress={() => router.replace('/cab')}>
           <Text style={s.btnPrimaryText}>بازگشت به صفحه اصلی</Text>
         </Pressable>
       </View>
@@ -325,8 +325,11 @@ export default function ActiveTripScreen() {
       <View style={[s.panel, { paddingBottom: insets.bottom + 18 }]}>
         <View style={[s.statusCard, { borderStartColor: toneColor(meta.tone) }]}>
           <View style={s.statusRow}>
-            {meta.tone === 'searching' && <ActivityIndicator size="small" color={COLORS.brand} />}
-            <Text style={[s.statusText, meta.tone === 'error' && { color: COLORS.error }]}>{meta.label}</Text>
+            {meta.tone === 'searching' ? <SearchIllustration /> : null}
+            <View style={s.statusCopy}>
+              <Text style={[s.statusText, meta.tone === 'error' && { color: COLORS.error }]}>{meta.label}</Text>
+              {meta.tone === 'searching' ? <Text style={s.statusSubtext}>درخواست شما برای سفیران نزدیک ارسال شده است</Text> : null}
+            </View>
           </View>
         </View>
 
@@ -353,7 +356,7 @@ export default function ActiveTripScreen() {
             <View style={s.infoDivider} />
             <InfoRow label="مسافت" value={`${stats.distanceKm.toLocaleString('fa-IR')} کیلومتر`} />
             <InfoRow label="مدت" value={`حدود ${stats.durationMin.toLocaleString('fa-IR')} دقیقه`} />
-            <InfoRow label="کرایه" value={`${formatToman(stats.estimatedPrice)} تومان`} accent />
+            <InfoRow label="هزینه سفر" value={`${formatToman(stats.estimatedPrice)} تومان`} accent />
           </View>
         )}
 
@@ -365,7 +368,7 @@ export default function ActiveTripScreen() {
           </Pressable>
         )}
         {ended && (
-          <Pressable style={s.btnPrimary} onPress={() => router.replace('/(passenger)')}>
+          <Pressable style={s.btnPrimary} onPress={() => router.replace('/cab')}>
             <Text style={s.btnPrimaryText}>بازگشت به صفحه اصلی</Text>
           </Pressable>
         )}
@@ -405,13 +408,32 @@ function InfoRow({ label, value, accent }: { label: string; value: string; accen
   );
 }
 
+function SearchIllustration() {
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(pulse, { toValue: 1, duration: 1400, useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 0, duration: 1400, useNativeDriver: true }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+  return (
+    <View style={s.searchIllustration}>
+      <Animated.View style={[s.searchPulse, { opacity: pulse.interpolate({ inputRange: [0, 1], outputRange: [0.75, 0.15] }), transform: [{ scale: pulse.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1.15] }) }] }]} />
+      <View style={s.searchCar}><View style={s.searchCarRoof} /><View style={s.searchWheelOne} /><View style={s.searchWheelTwo} /></View>
+      <View style={s.searchRoad}><View style={s.searchRoadDash} /><View style={s.searchRoadDash} /><View style={s.searchRoadDash} /></View>
+    </View>
+  );
+}
+
 const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bg },
   mapArea: { flex: 1 },
 
   header: {
     position: 'absolute', left: SPACING.lg, right: SPACING.lg, zIndex: 50,
-    flexDirection: 'row-reverse', alignItems: 'center', justifyContent: 'space-between',
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
   },
   headerBtn: {
     width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.surface,
@@ -437,8 +459,18 @@ const s = StyleSheet.create({
     borderRightWidth: 3.5, paddingVertical: 10, paddingHorizontal: SPACING.md,
     marginBottom: SPACING.md,
   },
-  statusRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 10 },
-  statusText: { flex: 1, fontFamily: FONTS.semibold, fontSize: 14, color: COLORS.text, textAlign: 'right', lineHeight: 21 },
+  statusRow: { flexDirection: 'row-reverse', alignItems: 'center', gap: 12 },
+  statusCopy: { flex: 1, gap: 3 },
+  statusText: { fontFamily: FONTS.semibold, fontSize: 14, color: COLORS.text, textAlign: 'right', lineHeight: 21 },
+  statusSubtext: { fontFamily: FONTS.regular, fontSize: 11, color: COLORS.textSecondary, textAlign: 'right', lineHeight: 18 },
+  searchIllustration: { width: 62, height: 54, alignItems: 'center', justifyContent: 'center' },
+  searchPulse: { position: 'absolute', width: 48, height: 48, borderRadius: 24, borderWidth: 2, borderColor: '#CBD5E1' },
+  searchCar: { width: 32, height: 16, borderRadius: 5, backgroundColor: COLORS.brand, marginTop: -5 },
+  searchCarRoof: { position: 'absolute', width: 18, height: 9, left: 7, top: -6, borderTopLeftRadius: 7, borderTopRightRadius: 7, backgroundColor: COLORS.brand },
+  searchWheelOne: { position: 'absolute', width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.surface, left: 4, bottom: -4 },
+  searchWheelTwo: { position: 'absolute', width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.surface, right: 4, bottom: -4 },
+  searchRoad: { position: 'absolute', bottom: 3, flexDirection: 'row', gap: 4 },
+  searchRoadDash: { width: 9, height: 2, borderRadius: 1, backgroundColor: COLORS.textTertiary },
 
   driverCard: {
     flexDirection: 'row-reverse', alignItems: 'center', gap: 12,
@@ -453,9 +485,9 @@ const s = StyleSheet.create({
   },
 
   infoCard: { marginBottom: SPACING.md },
-  infoRow: { flexDirection: 'row-reverse', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 5 },
+  infoRow: { flexDirection: 'row-reverse', alignItems: 'center', paddingVertical: 5, columnGap: SPACING.md },
   infoLabel: { fontFamily: FONTS.regular, fontSize: 13, color: COLORS.textSecondary, textAlign: 'right', writingDirection: 'rtl' as any },
-  infoValue: { flex: 1, fontFamily: FONTS.medium, fontSize: 13, color: COLORS.text, textAlign: 'right', writingDirection: 'rtl' as any, marginLeft: SPACING.md },
+  infoValue: { flex: 1, fontFamily: FONTS.medium, fontSize: 13, color: COLORS.text, textAlign: 'right', writingDirection: 'rtl' as any },
   infoValueAccent: { fontFamily: FONTS.bold, color: COLORS.brand, fontSize: 15 },
   infoDivider: { height: 1, backgroundColor: COLORS.divider, marginVertical: 6 },
 

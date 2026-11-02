@@ -55,6 +55,11 @@ class ApiService {
       body: JSON.stringify({ phone, otp, role, firstName, lastName }),
     });
 
+  switchRole = (role: 'PASSENGER' | 'DRIVER') =>
+    this.request<{ token: string; user: any }>('/auth/switch-role', {
+      method: 'POST', body: JSON.stringify({ role }),
+    });
+
   getProfile = () => this.request<any>('/auth/profile');
 
   // Trips
@@ -93,7 +98,7 @@ class ApiService {
   getDriverStatus = () => this.request<any>('/drivers/status');
 
   getNearbyDrivers = (latitude: number, longitude: number) =>
-    this.request<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number }>>(`/drivers/nearby?lat=${latitude}&lng=${longitude}`);
+    this.request<Array<{ id: string; latitude: number; longitude: number; heading?: number; isAccepting: boolean; distanceKm: number; lastSeenAt?: string }>>(`/drivers/nearby?lat=${latitude}&lng=${longitude}`);
 
   updateDriverStatus = (data: { isOnline?: boolean; isAccepting?: boolean; latitude?: number; longitude?: number; heading?: number }) =>
     this.request<any>('/drivers/status', { method: 'PUT', body: JSON.stringify(data) });
@@ -105,9 +110,8 @@ class ApiService {
 
   getPendingOffers = () => this.request<any[]>('/drivers/pending-offers');
 
-  // Geocoding via backend proxy
-  reverseGeocode = (lat: number, lng: number) =>
-    this.request<{ address: string }>(`/trips/reverse-geocode?lat=${lat}&lng=${lng}`);
+  reverseGeocode = (lat: number, lng: number, signal?: AbortSignal) =>
+    this.request<{ address: string }>(`/trips/reverse-geocode?lat=${lat}&lng=${lng}`, { signal });
 
   searchAddress = (q: string) =>
     this.request<any[]>(`/trips/search-address?q=${encodeURIComponent(q)}`);

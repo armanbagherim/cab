@@ -66,28 +66,18 @@ export default function LoginScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Hero */}
-      <View style={styles.hero}>
-        <Image
-          source={require('../assets/images/login-hero.jpg')}
-          style={styles.heroImage}
-          resizeMode="cover"
-          fadeDuration={0}
-        />
-        <View style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(9, 20, 16, 0.42)' }]} />
-        <View style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(9, 20, 16, 0.2)' }]} />
-        <View style={styles.heroContent}>
-          <View style={styles.brandBadge}>
-            <Text style={styles.brandLetter}>س</Text>
-          </View>
-        </View>
-        {/* Back to role selection — shared back button, arrow points left */}
-        <View style={[styles.backBtnWrap, { top: insets.top + 10 }]}>
-          <BackButton light onPress={() => router.back()} />
-        </View>
+      <Image
+        source={require('../assets/images/login-hero.jpg')}
+        style={styles.backgroundImage}
+        resizeMode="cover"
+        fadeDuration={0}
+      />
+      <View style={styles.backgroundScrim} />
+      <View style={[styles.backBtnWrap, { top: insets.top + 10 }]}>
+        <BackButton light onPress={() => router.back()} />
       </View>
 
-      {/* Sheet — bottom padding lifts the Continue button above the keyboard
+      {/* Bottom sheet — padding lifts the Continue button above the keyboard
           on both native and iOS Safari/WebView (VisualViewport-based hook). */}
       <View style={styles.sheetWrap}>
         <View
@@ -157,26 +147,17 @@ export default function LoginScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bg },
 
-  hero: { height: '42%', minHeight: 260, backgroundColor: '#0B1512' },
-  heroImage: { ...StyleSheet.absoluteFill as any, width: '100%', height: '100%' },
-  heroContent: {
-    flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 30,
-  },
-  brandBadge: {
-    width: 72, height: 72, borderRadius: 24,
-    backgroundColor: COLORS.brand, justifyContent: 'center', alignItems: 'center',
-    borderWidth: 4, borderColor: 'rgba(255,255,255,0.92)', ...SHADOW.md,
-  },
-  brandLetter: { fontFamily: FONTS.bold, fontSize: 34, color: '#fff', marginTop: -3 },
+  backgroundImage: { ...StyleSheet.absoluteFill as any, width: '100%', height: '100%' },
+  backgroundScrim: { ...StyleSheet.absoluteFill as any, backgroundColor: 'rgba(8, 18, 15, 0.42)' },
 
   backBtnWrap: {
     position: 'absolute', left: SPACING.lg,
   },
-  sheetWrap: { flex: 1 },
+  sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0, maxHeight: '68%' },
   sheet: {
-    flex: 1, backgroundColor: COLORS.surface,
+    backgroundColor: 'rgba(255,255,255,0.94)',
     borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl,
-    marginTop: -RADIUS.xl,
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.75)',
     paddingHorizontal: SPACING.xxl, paddingTop: 10,
     ...SHADOW.lg,
   },

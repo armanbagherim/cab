@@ -160,7 +160,7 @@ export default function TripHistoryScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bg },
   headerRow: {
-    flexDirection: 'row-reverse', alignItems: 'center', gap: SPACING.md,
+    flexDirection: 'row', alignItems: 'center', gap: SPACING.md,
     paddingHorizontal: SPACING.lg, paddingVertical: SPACING.md,
   },
   title: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text },

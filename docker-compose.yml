@@ -1,0 +1,28 @@
+services:
+  server:
+    build:
+      context: ./apps/server
+      dockerfile: Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_URL: file:/data/dev.db
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      NESHAN_TILE_API_KEY: ${NESHAN_TILE_API_KEY:-}
+      NESHAN_WEB_MAP_API_KEY: ${NESHAN_WEB_MAP_API_KEY:-}
+      NESHAN_SERVICE_API_KEY: ${NESHAN_SERVICE_API_KEY:-}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        EXPO_PUBLIC_API_URL: /api
+        EXPO_PUBLIC_SOCKET_URL: /
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+    restart: unless-stopped

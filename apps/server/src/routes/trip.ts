@@ -10,6 +10,18 @@ import { config } from '../config';
 
 const router = Router();
 
+const reverseGeocodeCache = new Map<string, string>();
+const reverseGeocodeKey = (lat: number, lng: number) => `${lat.toFixed(5)},${lng.toFixed(5)}`;
+async function resolveAddress(lat: number, lng: number): Promise<string> {
+  const key = reverseGeocodeKey(lat, lng);
+  const cached = reverseGeocodeCache.get(key);
+  if (cached) return cached;
+  const result = await reverseGeocode(lat, lng);
+  const address = result.formatted_address || '';
+  if (address) reverseGeocodeCache.set(key, address);
+  return address;
+}
+
 const estimateSchema = z.object({
   originLat: z.number(),
   originLng: z.number(),
@@ -91,30 +103,14 @@ router.post('/estimate', authMiddleware, async (req: Request, res: Response) => 
     const durationMin = Math.round(routeResult.duration / 60);
     const price = calculatePrice(distanceKm, durationMin);
 
-    // Get addresses (best-effort)
-    let originAddress = '';
-    let destAddress = '';
-    try {
-      const o = await reverseGeocode(body.originLat, body.originLng);
-      originAddress = o.formatted_address;
-    } catch (e: any) {
-      console.warn('[trip:estimate] origin reverse geocode failed', e?.message || e);
-    }
-    try {
-      const d = await reverseGeocode(body.destLat, body.destLng);
-      destAddress = d.formatted_address;
-    } catch (e: any) {
-      console.warn('[trip:estimate] dest reverse geocode failed', e?.message || e);
-    }
-
     res.json({
       success: true,
       data: {
         distanceKm: Math.round(distanceKm * 10) / 10,
         durationMin,
         estimatedPrice: price,
-        originAddress,
-        destAddress,
+        originAddress: '',
+        destAddress: '',
         route: routeResult.routes[0]?.overview_polyline?.points || null,
       },
     });
@@ -166,20 +162,16 @@ router.post('/', authMiddleware, requireRole('PASSENGER'), async (req: Request, 
     const durationMin = Math.round(routeResult.duration / 60);
     const price = calculatePrice(distanceKm, durationMin);
 
-    // Get addresses
+    // Resolve addresses only for the final trip. Selection and estimates stay free.
     let originAddress = body.originAddress || '';
     let destAddress = body.destAddress || '';
-    try {
-      if (!originAddress) {
-        const oRes = await reverseGeocode(body.originLat, body.originLng);
-        originAddress = oRes.formatted_address;
-      }
-      if (!destAddress) {
-        const dRes = await reverseGeocode(body.destLat, body.destLng);
-        destAddress = dRes.formatted_address;
-      }
-    } catch {
-      // continue with empty addresses
+    if (!originAddress || !destAddress) {
+      const [resolvedOrigin, resolvedDest] = await Promise.all([
+        originAddress ? Promise.resolve(originAddress) : resolveAddress(body.originLat, body.originLng).catch(() => ''),
+        destAddress ? Promise.resolve(destAddress) : resolveAddress(body.destLat, body.destLng).catch(() => ''),
+      ]);
+      originAddress ||= resolvedOrigin;
+      destAddress ||= resolvedDest;
     }
 
     // Wallet payment: validate authoritative balance before accepting the
@@ -490,6 +482,7 @@ async function selectCandidates(
     select: {
       userId: true, latitude: true, longitude: true, updatedAt: true,
       selectedActive: true, selectedLat: true, selectedLng: true, selectedRadiusKm: true,
+      user: { select: { isActive: true } },
     },
   });
   // `isOnTrip` is a fast eligibility index, not the source of truth. Exclude
@@ -513,7 +506,7 @@ async function selectCandidates(
   const fresh: Candidate[] = [];
   const staleGrace: Candidate[] = [];
   for (const row of rows) {
-    if (busyDriverIds.has(row.userId)) continue;
+    if (busyDriverIds.has(row.userId) || !row.user.isActive) continue;
     const lat = row.latitude!;
     const lng = row.longitude!;
     if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
@@ -528,6 +521,7 @@ async function selectCandidates(
     const distance = calculateDistance(trip.originLat, trip.originLng, lat, lng);
     if (distance > radiusKm) continue;
     const updatedAtMs = row.updatedAt ? new Date(row.updatedAt).getTime() : 0;
+    if (updatedAtMs < now - config.driverSearch.staleDriverMs) continue;
     const preferred = Boolean(
       row.selectedActive && row.selectedLat !== null && row.selectedLng !== null
       && calculateDistance(trip.originLat, trip.originLng, row.selectedLat, row.selectedLng) <= row.selectedRadiusKm,
@@ -1133,8 +1127,8 @@ router.get('/reverse-geocode', authMiddleware, async (req: Request, res: Respons
     return;
   }
   try {
-    const result = await reverseGeocode(lat, lng);
-    res.json({ success: true, data: { address: result.formatted_address } });
+    const address = await resolveAddress(lat, lng);
+    res.json({ success: true, data: { address } });
   } catch {
     res.status(502).json({ success: false, error: 'Reverse geocode failed' });
   }

@@ -32,6 +32,11 @@ function onDriverSocketClosed(driverId: string): void {
   }
   driverSocketCount.delete(driverId);
   connectedDriverIds.delete(driverId);
+  void prisma.driverStatus.updateMany({
+    where: { userId: driverId },
+    data: { isOnline: false, isAccepting: false, selectedActive: false, selectedLat: null, selectedLng: null, updatedAt: new Date() },
+  }).catch((err) => console.error('[WS][DRIVER_OFFLINE_PERSIST]', err));
+  io?.emit('drivers:status', { id: driverId, isOnline: false, isAccepting: false });
 }
 
 export function initSocket(httpServer: HttpServer): Server {
@@ -93,7 +98,9 @@ export function initSocket(httpServer: HttpServer): Server {
         }
         const status = await prisma.driverStatus.update({
           where: { userId: user.userId },
-          data: { ...data, updatedAt: new Date() },
+          data: (data.isOnline === false || data.isAccepting === false)
+            ? { ...data, selectedActive: false, selectedLat: null, selectedLng: null, updatedAt: new Date() }
+            : { ...data, updatedAt: new Date() },
         });
         console.log('[WS][DRIVER_STATUS]', { userId: user.userId, ...data, isOnline: status.isOnline, isAccepting: status.isAccepting });
         io.emit('drivers:status', {
@@ -120,6 +127,11 @@ export function initSocket(httpServer: HttpServer): Server {
       }
 
       try {
+        const status = await prisma.driverStatus.findUnique({
+          where: { userId: user.userId },
+          select: { isOnline: true, isAccepting: true },
+        });
+        if (!status?.isOnline || !status.isAccepting) return;
         const wasStale = await isDriverLocationStale(user.userId);
         await persistDriverLocation(user.userId, latitude, longitude, heading);
 
@@ -204,7 +216,11 @@ async function persistDriverLocation(
   if (prev) {
     const dt = now - prev.atMs;
     const movedM = Math.hypot(latitude - prev.lat, longitude - prev.lng) * 111_000;
-    if (dt < 1000 && movedM < 10) return; // duplicate/micro-move: skip DB write
+    if (dt < 1000 && movedM < 10) {
+      // Keep the persisted timestamp a heartbeat even when the coordinate did not move.
+      await prisma.driverStatus.update({ where: { userId: driverId }, data: { updatedAt: new Date(now) } });
+      return;
+    }
   }
   locationWriteState.set(driverId, { lat: latitude, lng: longitude, atMs: now });
   await prisma.driverStatus.update({

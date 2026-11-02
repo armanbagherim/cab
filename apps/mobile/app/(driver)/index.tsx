@@ -128,13 +128,17 @@ export default function DriverScreen() {
         if (isOnlineRef.current && coordsRef.current) {
           sendDriverLocation(coordsRef.current.latitude, coordsRef.current.longitude);
         }
-        if (profile?.driverStatus?.selectedLat != null && profile?.driverStatus?.selectedLng != null) {
+        const presenceFresh = profile?.driverStatus?.updatedAt
+          && Date.now() - Date.parse(profile.driverStatus.updatedAt) <= 60 * 60 * 1000;
+        if (presenceFresh && profile?.driverStatus?.isOnline && profile?.driverStatus?.isAccepting
+          && profile?.driverStatus?.selectedActive
+          && profile?.driverStatus?.selectedLat != null && profile?.driverStatus?.selectedLng != null) {
           console.log('[Driver][SELECTED_ROUTE_PROFILE]', profile.driverStatus);
           setSelectedRoute({
             latitude: profile.driverStatus.selectedLat,
             longitude: profile.driverStatus.selectedLng,
             radiusKm: profile.driverStatus.selectedRadiusKm || 5,
-            active: !!profile.driverStatus.selectedActive,
+             active: true,
           });
         }
         // Also hit the driver status endpoint on login so the server wakes
@@ -294,7 +298,7 @@ export default function DriverScreen() {
     try {
       await api.updateSelectedRoute(next);
       console.log('[Driver][SELECTED_ROUTE_SAVE]', next);
-      setSelectedRoute(next);
+       setSelectedRoute(next.active ? next : null);
       setRoutePicking(false);
     } catch (e: any) {
       setDialog({ title: 'ذخیره مسیر منتخب ناموفق بود', message: e?.message || 'دوباره تلاش کنید' });
@@ -307,7 +311,7 @@ export default function DriverScreen() {
     try {
       await api.updateSelectedRoute(next);
       console.log('[Driver][SELECTED_ROUTE_TOGGLE]', next);
-      setSelectedRoute(next);
+       setSelectedRoute(next.active ? next : null);
     } catch (e: any) {
       setDialog({ title: 'تغییر مسیر منتخب ناموفق بود', message: e?.message || 'دوباره تلاش کنید' });
     }
@@ -430,7 +434,7 @@ export default function DriverScreen() {
       { id: 'origin', latitude: trip.originLat, longitude: trip.originLng, color: COLORS.pinOrigin, label: 'مبدأ' },
       { id: 'dest', latitude: trip.destLat, longitude: trip.destLng, color: COLORS.pinDest, label: 'مقصد' },
     );
-    if (selectedRoute) m.push({ id: 'selected-route', latitude: selectedRoute.latitude, longitude: selectedRoute.longitude, color: COLORS.success, label: 'مسیر منتخب' });
+    if (selectedRoute?.active) m.push({ id: 'selected-route', latitude: selectedRoute.latitude, longitude: selectedRoute.longitude, color: COLORS.success, label: 'مسیر منتخب' });
     return m;
   }, [trip?.id, trip?.originLat, trip?.originLng, trip?.destLat, trip?.destLng, selectedRoute]);
 
@@ -632,7 +636,7 @@ export default function DriverScreen() {
           <OfferRow label="مبدأ" value={trip.originAddress || '—'} />
           <OfferRow label="مقصد" value={trip.destAddress || '—'} />
           <View style={s.tripFareRow}>
-            <Text style={s.tripFareLabel}>کرایه</Text>
+            <Text style={s.tripFareLabel}>هزینه سفر</Text>
             <Text style={s.tripFare}>{formatToman(trip.estimatedPrice)} تومان</Text>
           </View>
 
@@ -674,7 +678,7 @@ export default function DriverScreen() {
       {!trip ? <View style={[s.bottomBar, { paddingBottom: insets.bottom + 14 }]}> 
         {!trip ? (
           <Pressable style={s.selectedRouteBtn} onPress={routePicking ? undefined : selectedRoute?.active ? () => setRoutePicking(true) : toggleSelectedRoute}>
-            <Text style={s.selectedRouteText}>{routePicking ? 'روی نقشه نقطه مسیر منتخب را انتخاب کنید' : selectedRoute?.active ? 'تغییر نقطه مسیر منتخب' : 'مسیر منتخب — انتخاب محدوده'}</Text>
+            <Text style={s.selectedRouteText}>{routePicking ? 'روی نقشه نقطه مسیر منتخب را انتخاب کنید' : selectedRoute?.active ? 'تغییر نقطه مسیر منتخب' : 'انتخاب محدوده'}</Text>
           </Pressable>
         ) : null}
         {!trip && selectedRoute?.active && !routePicking ? (

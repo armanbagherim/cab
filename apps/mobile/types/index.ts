@@ -15,6 +15,11 @@ export interface DriverStatus {
   isOnTrip: boolean;
   latitude: number | null;
   longitude: number | null;
+  updatedAt?: string;
+  selectedLat?: number | null;
+  selectedLng?: number | null;
+  selectedRadiusKm?: number;
+  selectedActive?: boolean;
 }
 
 export interface Trip {

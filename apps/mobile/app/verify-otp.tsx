@@ -41,7 +41,7 @@ export default function VerifyOtpScreen() {
     // Route from the role the backend actually stored — never from local params alone.
     const resolvedRole = (r.user?.role as string) || role;
     await login(r.token, r.user);
-    router.replace(resolvedRole === 'DRIVER' ? '/(driver)' : '/(passenger)');
+      router.replace(resolvedRole === 'DRIVER' ? '/(driver)' : '/cab');
   }
 
   async function handleVerify() {
