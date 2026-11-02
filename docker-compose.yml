@@ -21,6 +21,7 @@ services:
       args:
         EXPO_PUBLIC_API_URL: /api
         EXPO_PUBLIC_SOCKET_URL: /
+        EXPO_PUBLIC_NESHAN_TILE_KEY: ${EXPO_PUBLIC_NESHAN_TILE_KEY}
     depends_on:
       - server
     ports:

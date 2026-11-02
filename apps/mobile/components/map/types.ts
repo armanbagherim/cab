@@ -56,6 +56,9 @@ export type NeshanMapComponent = React.ForwardRefExoticComponent<
 /** Neshan raster tile URL (single style; source created once per map lifecycle). */
 export function tileUrlTemplate(): string {
   const key = process.env.EXPO_PUBLIC_NESHAN_TILE_KEY || '';
+  if (!key && process.env.NODE_ENV !== 'production') {
+    console.warn('EXPO_PUBLIC_NESHAN_TILE_KEY is missing');
+  }
   return `https://api.neshan.org/tile/raster/basemap/{z}/{x}/{y}?style=neshan&Api-key=${key}`;
 }
 
